@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+streamlit
+langgraph
+langchain-groq
+langchain-community
+duckduckgo-search
+python-dotenv
+requests
+arxiv
