@@ -62,6 +62,51 @@ The agent is equipped with the following tools:
      - "Find recent papers on retrieval augmented generation"
      - "Summarize a paper about LLM agents"
 
+## Conversational Memory
+
+The agent now supports **persistent conversation history per browser session** using LangGraph's `MemorySaver` checkpoint system.
+
+### How It Works
+
+- Each Streamlit browser session automatically gets a unique `thread_id` stored in `st.session_state`
+- This `thread_id` is sent with every request to the FastAPI backend
+- The LangGraph agent uses this `thread_id` to load and save conversation history
+- Follow-up questions can reference previous answers, and the agent understands the context
+
+### Example: Multi-Turn Conversation
+
+**Turn 1 — User asks:**
+```
+What's the latest Python version?
+```
+
+**Agent responds:**
+```
+As of my latest knowledge update, Python 3.13 is the latest stable release...
+```
+
+**Turn 2 — User asks a follow-up (same browser session):**
+```
+Is it backward compatible with 3.11 code?
+```
+
+**Agent understands context:**
+```
+Python 3.13 maintains backward compatibility with Python 3.11. Most standard
+library changes and deprecations are managed carefully to avoid breaking existing code...
+```
+The agent understood that "it" refers to "Python 3.13" from the previous turn, demonstrating that conversation history is retained.
+
+### Technical Details
+
+- **Backend:** FastAPI accepts an optional `thread_id` in the request. If not provided, a new UUID is generated.
+- **Frontend:** Streamlit initializes `st.session_state.thread_id` on first page load and includes it in all requests.
+- **Checkpointing:** The LangGraph agent uses `MemorySaver()` to persist the conversation state, automatically loading prior messages for the same `thread_id`.
+
+### Resetting the Conversation
+
+To start a new conversation (clearing history), simply refresh the browser page. A new `thread_id` will be generated automatically.
+
 ## Tech Stack
 
 | Component        | Technology                                       |
@@ -144,34 +189,3 @@ The UI will open at `http://localhost:8501`.
 2. Type a question (e.g., "What are the latest breakthroughs in fusion energy?")
 3. Click **Ask the Agent**
 4. See the agent's answer and expand the reasoning trace to see which web searches it performed
-
-## API Reference
-
-### `POST /ask`
-
-**Request:**
-```json
-{
-  "question": "What is the capital of France?"
-}
-```
-
-**Response:**
-```json
-{
-  "answer": "The capital of France is Paris...",
-  "steps": [
-    {
-      "tool": "web_search",
-      "query": {"query": "capital of France"},
-      "result": "[snippet: Paris is the capital...]"
-    }
-  ]
-}
-```
-
-If the agent answers without searching, `steps` will be an empty list.
-
-## License
-
-MIT

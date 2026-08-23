@@ -16,6 +16,7 @@ from langchain_groq import ChatGroq
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 # Load environment variables from .env file (picks up GROQ_API_KEY)
 load_dotenv()
@@ -152,20 +153,25 @@ SYSTEM_PROMPT = (
 
 # ── Agent Setup ────────────────────────────────────────────────────────────────
 # create_react_agent builds a ReAct agent as a LangGraph StateGraph.
+# MemorySaver enables persistent conversation history per thread_id (session).
+checkpointer = MemorySaver()
 agent = create_react_agent(
     model=llm,
     tools=tools,
     prompt=SYSTEM_PROMPT,
+    checkpointer=checkpointer,
 )
 
 
-def run_agent(question: str) -> dict:
+def run_agent(question: str, thread_id: str) -> dict:
     """
     Run the agent on a user question and return the final answer
     along with a trace of reasoning steps (tool calls made).
 
     Args:
         question: The user's natural language question.
+        thread_id: A unique identifier for the conversation session.
+                   The agent will retain conversation history for this thread_id.
 
     Returns:
         dict with keys:
@@ -174,7 +180,12 @@ def run_agent(question: str) -> dict:
               e.g. [{"tool": "web_search", "query": "...", "result": "..."}]
     """
     # Invoke the agent with the user's question as a HumanMessage
-    result = agent.invoke({"messages": [{"role": "user", "content": question}]})
+    # Pass config with thread_id so the agent retains conversation history in this session
+    config = {"configurable": {"thread_id": thread_id}}
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": question}]},
+        config=config,
+    )
 
     # ── Extract the final answer ───────────────────────────────────────────
     # The last message in the conversation is the agent's final response

@@ -10,6 +10,7 @@ Features:
 """
 
 import json
+import uuid
 import requests
 import streamlit as st
 from theme_tokens import TOKENS
@@ -20,6 +21,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Conversation Memory Setup ──────────────────────────────────────────────────
+# Generate a unique thread_id for this browser session on first load.
+# This enables the agent to retain conversation history for follow-up questions.
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
 
 # ── Backend URL ────────────────────────────────────────────────────────────────
 BACKEND_URL = "http://localhost:8000"
@@ -532,7 +539,7 @@ if (submit_pressed or selected_prompt) and query_to_run:
             try:
                 res = requests.post(
                     f"{BACKEND_URL}/ask",
-                    json={"question": query_to_run},
+                    json={"question": query_to_run, "thread_id": st.session_state.thread_id},
                     timeout=120,
                 )
 
@@ -540,6 +547,7 @@ if (submit_pressed or selected_prompt) and query_to_run:
                     data = res.json()
                     answer = data.get("answer", "")
                     steps = data.get("steps", [])
+                    thread_id = data.get("thread_id", "")
 
                     # Glassmorphic Answer Bubble
                     st.markdown(
@@ -551,6 +559,9 @@ if (submit_pressed or selected_prompt) and query_to_run:
                             </div>
                             <div style="color: #FAF5F0; font-size: 0.95rem; line-height: 1.65;">
                                 {answer}
+                            </div>
+                            <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--color-border-glass); font-size: 0.75rem; color: var(--color-text-tertiary); font-family: var(--font-mono);">
+                                Session ID: {thread_id}
                             </div>
                         </div>
                         """,
