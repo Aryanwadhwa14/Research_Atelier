@@ -4,7 +4,7 @@ streamlit
 langgraph
 langchain-groq
 langchain-community
-duckduckgo-search
+ddgs>=9.0.0,<10.0.0
 python-dotenv
 requests
 arxiv
