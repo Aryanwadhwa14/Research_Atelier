@@ -25,7 +25,10 @@ class WebSearchReliabilityTests(unittest.TestCase):
         callback = agent._ModelTimingCallback()
         response = SimpleNamespace(
             llm_output={"token_usage": {"prompt_tokens": 17, "completion_tokens": 9}},
-            generations=[],
+            generations=[[SimpleNamespace(
+                generation_info={"finish_reason": "length"},
+                message=SimpleNamespace(usage_metadata={}),
+            )]],
         )
         with patch("agent.time.perf_counter", side_effect=[10.0, 10.125]):
             callback.on_chat_model_start({}, [], run_id="metrics-test")
@@ -35,6 +38,7 @@ class WebSearchReliabilityTests(unittest.TestCase):
         self.assertIn("duration_ms=125.0", captured.output[0])
         self.assertIn("input_tokens=17", captured.output[0])
         self.assertIn("output_tokens=9", captured.output[0])
+        self.assertIn("finish_reason=length", captured.output[0])
         self.assertNotIn("prompt text", captured.output[0])
 
     def test_timeout_retries_are_bounded_and_return_an_explicit_failure(self):
@@ -233,7 +237,9 @@ class IncompleteCheckpointTests(unittest.TestCase):
             result = agent.run_agent("Continue the discussion", "incomplete-checkpoint-test")
 
         self.assertEqual(result["answer"], "Checkpoint recovered without losing history.")
-        self.assertEqual([step["tool"] for step in result["steps"]], ["web_search", "arxiv_tool"])
+        # Repaired calls belong to the earlier checkpoint turn; the API trace
+        # for this request must not present old tool calls as current attempts.
+        self.assertEqual(result["steps"], [])
         saved_messages = graph.get_state(config).values["messages"]
         self.assertEqual(saved_messages[0].content, "Earlier thread history")
         self.assertEqual(

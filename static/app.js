@@ -4,6 +4,9 @@ const {normalizeReviewData, removeRepositorySection, reviewToMarkdown} = window.
 let revealObserver = null;
 let revealDelayIndex = 0;
 const observedRevealTargets = new WeakSet();
+const CHAT_REQUEST_TIMEOUT_MS = 180000;
+let chatRequestEpoch = 0;
+const activeChatControllers = new Set();
 let threadId = sessionStorage.getItem('research-thread') || crypto.randomUUID();
 sessionStorage.setItem('research-thread', threadId);
 
@@ -81,30 +84,61 @@ async function ask(question) {
   loading.className = 'typing';
   loading.textContent = 'Searching sources and synthesizing…';
   chatLog.append(loading);
+  const requestEpoch = chatRequestEpoch;
+  const controller = typeof AbortController === 'undefined' ? null : new AbortController();
+  if (controller) activeChatControllers.add(controller);
+  let timedOut = false;
+  let rejectTimeout;
+  const timeoutPromise = new Promise((_, reject) => { rejectTimeout = reject; });
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller?.abort();
+    rejectTimeout(new Error('Chat request timed out'));
+  }, CHAT_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch('/ask', {
+    const request = fetch('/ask', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question, thread_id: threadId})
+      body: JSON.stringify({question, thread_id: threadId}),
+      ...(controller ? {signal: controller.signal} : {})
     });
+    const response = await Promise.race([request, timeoutPromise]);
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
     threadId = data.thread_id;
     sessionStorage.setItem('research-thread', threadId);
-    loading.remove();
-    addMessage(data.answer || 'The assistant returned an empty answer.', 'assistant', `${(data.steps || []).length} tool call(s)`);
+    const answer = data.answer || 'The assistant returned an empty answer.';
+    const incomplete = answer.match(/^⚠ Incomplete response: ([^\n]+)\n\n([\s\S]*)$/);
+    const message = incomplete ? incomplete[2] : answer;
+    const toolCount = (data.steps || []).length;
+    const meta = incomplete
+      ? `Incomplete answer · ${incomplete[1]} · ${toolCount} tool call(s) attempted`
+      : `${toolCount} tool call(s) attempted`;
+    addMessage(message, incomplete ? 'assistant incomplete' : 'assistant', meta);
   } catch (error) {
+    if (requestEpoch === chatRequestEpoch) {
+      const detail = timedOut
+        ? 'The assistant request timed out. Please try again.'
+        : error?.name === 'AbortError'
+          ? 'The assistant request was cancelled.'
+          : error?.message === 'Failed to fetch'
+            ? 'The assistant could not be reached. Check your connection and try again.'
+            : error?.message || 'The assistant request failed. Please try again.';
+      addMessage(detail, 'error');
+    }
+  } finally {
+    clearTimeout(timeoutId);
     loading.remove();
-    addMessage(`${error.message}. Check that the FastAPI service and GROQ_API_KEY are configured.`, 'error');
+    if (controller) activeChatControllers.delete(controller);
   }
 }
 
-$('#chat-form').addEventListener('submit', (event) => {
+$('#chat-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = $('#chat-input');
   const question = input.value.trim();
   if (!question) return;
   input.value = '';
-  ask(question);
+  await ask(question);
 });
 $('#chat-input').addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
@@ -117,6 +151,9 @@ document.querySelectorAll('.prompt-chip').forEach((button) => button.addEventLis
   $('#chat-input').focus();
 }));
 $('#new-chat').addEventListener('click', () => {
+  chatRequestEpoch += 1;
+  activeChatControllers.forEach((controller) => controller.abort());
+  activeChatControllers.clear();
   threadId = crypto.randomUUID();
   sessionStorage.setItem('research-thread', threadId);
   chatLog.innerHTML = '<div class="welcome-card"><div class="sparkle">✳</div><h3>What are you exploring?</h3><p>Ask a research question to get started. I can search the web, find academic papers, and look up GitHub projects.</p></div>';

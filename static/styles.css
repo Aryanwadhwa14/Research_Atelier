@@ -222,3 +222,5 @@ body,.topbar,.top-cta,.theme-toggle,.trust-strip,.chat-shell,.chat-top,.chat-log
 @media(max-width:430px){.topbar-actions{gap:7px}.theme-toggle{width:34px;height:34px}.top-cta{padding:8px 9px;font-size:9px}.brand{font-size:15px}.brand-mark{width:27px;height:27px}}
 @media(max-width:390px){.hero h1{font-size:36px;letter-spacing:-2px}}
 @media(prefers-reduced-motion:reduce){body::after,body,.topbar,.top-cta,.theme-toggle,.trust-strip,.chat-shell,.chat-top,.chat-log,.chat-form,.message,.review-section,.review-card,.review-results,.paper-card,.step-card,.architecture,.review-markdown,.prompt-chip,.download-button,footer,.visual-card,.source-node{transition-duration:0s!important}.theme-toggle{transition:none}}
+.message.incomplete{background:#fff8e8;color:#675225;border:1px solid #ead9a5}
+:root[data-theme="dark"] .message.incomplete{background:#3a3322;color:#f2dfa4;border-color:#6b5d36}

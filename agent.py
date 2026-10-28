@@ -21,16 +21,18 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from ddgs import DDGS
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import RemoveMessage, ToolMessage
+from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.errors import GraphRecursionError
 
 # Load environment variables from .env file (picks up GROQ_API_KEY)
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+CHAT_MODEL_MAX_TOKENS = 900
 
 # ── LLM Setup ──────────────────────────────────────────────────────────────────
 # ChatGroq wraps the Groq API. We use openai/gpt-oss-20b for fast inference,
@@ -41,7 +43,7 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
     timeout=30,
     max_retries=1,
-    max_tokens=900,
+    max_tokens=CHAT_MODEL_MAX_TOKENS,
 )
 
 
@@ -66,19 +68,28 @@ class _ModelTimingCallback(BaseCallbackHandler):
         usage = (getattr(response, "llm_output", None) or {}).get("token_usage") or {}
         input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
         output_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
+        finish_reasons = []
         if input_tokens is None or output_tokens is None:
             for batch in getattr(response, "generations", []) or []:
                 for generation in batch:
                     metadata = getattr(getattr(generation, "message", None), "usage_metadata", None) or {}
                     input_tokens = input_tokens if input_tokens is not None else metadata.get("input_tokens")
                     output_tokens = output_tokens if output_tokens is not None else metadata.get("output_tokens")
+        for batch in getattr(response, "generations", []) or []:
+            for generation in batch:
+                info = getattr(generation, "generation_info", None) or {}
+                message_metadata = getattr(getattr(generation, "message", None), "response_metadata", None) or {}
+                finish_reason = info.get("finish_reason") or message_metadata.get("finish_reason")
+                if finish_reason:
+                    finish_reasons.append(str(finish_reason))
         duration_ms = round((time.perf_counter() - started) * 1000, 1) if started else None
         logger.info(
-            "groq_call_complete model=%s duration_ms=%s input_tokens=%s output_tokens=%s",
+            "groq_call_complete model=%s duration_ms=%s input_tokens=%s output_tokens=%s finish_reason=%s",
             GROQ_MODEL,
             duration_ms,
             input_tokens,
             output_tokens,
+            ",".join(finish_reasons) or "unavailable",
         )
 
     def on_llm_error(self, error, *, run_id, **kwargs):
@@ -425,12 +436,67 @@ def _thread_lock(thread_id: str):
     return _THREAD_LOCKS[hash(thread_id) % len(_THREAD_LOCKS)]
 
 
+def _tool_call_signature(call: dict) -> tuple[str, str]:
+    return (
+        str(call.get("name") or ""),
+        json.dumps(call.get("args") or {}, sort_keys=True, ensure_ascii=False, default=str),
+    )
+
+
+def _stop_repeated_tool_batch(state: dict) -> dict:
+    """End a repeated tool-call batch before the graph executes it again."""
+    messages = list(state.get("messages", []))
+    if not messages:
+        return {}
+    last = messages[-1]
+    calls = getattr(last, "tool_calls", []) or []
+    if getattr(last, "type", None) != "ai" or not calls:
+        return {}
+
+    current_turn_start = next(
+        (index for index in range(len(messages) - 1, -1, -1)
+         if getattr(messages[index], "type", None) == "human"),
+        0,
+    )
+    previous_signatures = {
+        _tool_call_signature(call)
+        for message in messages[current_turn_start:-1]
+        if getattr(message, "type", None) == "ai"
+        for call in (getattr(message, "tool_calls", []) or [])
+    }
+    current_signatures = set()
+    repeated = []
+    for call in calls:
+        signature = _tool_call_signature(call)
+        if signature in previous_signatures or signature in current_signatures:
+            repeated.append(signature[0])
+        current_signatures.add(signature)
+    if not repeated:
+        return {}
+
+    logger.warning(
+        "agent_repeated_tool_batch_detected repeated_count=%s tool_names=%s",
+        len(repeated),
+        ",".join(sorted(set(repeated))),
+    )
+    # Replacing the same message ID removes its unexecuted tool calls from the
+    # checkpoint, so there is no orphaned call and the graph terminates here.
+    return {
+        "messages": [AIMessage(
+            id=getattr(last, "id", None),
+            content="I stopped a repeated source lookup and will answer from the evidence already collected.",
+            response_metadata={"researchos_incomplete_reason": "repeated_tool_call"},
+        )]
+    }
+
+
 agent = create_react_agent(
     model=llm,
     tools=tools,
     prompt=SYSTEM_PROMPT,
     checkpointer=checkpointer,
     pre_model_hook=_close_incomplete_tool_calls,
+    post_model_hook=_stop_repeated_tool_batch,
 )
 
 
@@ -484,6 +550,84 @@ def _repair_incomplete_tool_history(graph, config: dict) -> int:
     return len(pending)
 
 
+CHAT_FINAL_ATTEMPT_MAX_TOKENS = 650
+CHAT_FINAL_ATTEMPT_MAX_CHARS = 6500
+INCOMPLETE_RESPONSE_PREFIX = "⚠ Incomplete response: "
+
+
+def _message_finish_reason(message) -> str | None:
+    metadata = getattr(message, "response_metadata", None) or {}
+    reason = metadata.get("finish_reason") or metadata.get("stop_reason")
+    return str(reason) if reason else None
+
+
+def _message_was_truncated(message) -> bool:
+    reason = (_message_finish_reason(message) or "").lower()
+    if reason in {"length", "max_tokens", "token_limit", "max_output_tokens"}:
+        return True
+    usage = getattr(message, "usage_metadata", None) or {}
+    output_tokens = usage.get("output_tokens")
+    return isinstance(output_tokens, int) and output_tokens >= CHAT_MODEL_MAX_TOKENS
+
+
+def _bounded_final_answer(question: str, messages: list, partial_answer: str, reason: str) -> str | None:
+    """Make one concise no-tools final-answer attempt from collected evidence."""
+    evidence = []
+    for message in messages:
+        if getattr(message, "type", None) != "tool" or getattr(message, "status", None) == "error":
+            continue
+        content = str(getattr(message, "content", "") or "").strip()
+        if content:
+            evidence.append(content[:500])
+    evidence_text = "\n\n".join(f"Source result {index + 1}: {item}" for index, item in enumerate(evidence[-6:]))
+    prompt = (
+        "Write a concise, complete final answer to the user's question using only the partial answer and source results below. "
+        "The previous agent stopped before completion. Do not call tools or claim missing evidence. Prefer a short comparison "
+        "over a long table. Keep the answer under 450 words.\n\n"
+        f"User question:\n{question[:1400]}\n\n"
+        f"Source results collected:\n{evidence_text or 'No successful tool results were collected.'}\n\n"
+        f"Partial answer, if any:\n{(partial_answer or '')[:1800]}"
+    )[:CHAT_FINAL_ATTEMPT_MAX_CHARS]
+    started = time.perf_counter()
+    logger.info("agent_request_stage stage=bounded_final_attempt reason=%s", reason)
+    try:
+        response = llm.invoke(
+            prompt,
+            max_tokens=CHAT_FINAL_ATTEMPT_MAX_TOKENS,
+            config={"callbacks": [_ModelTimingCallback()]},
+        )
+    except Exception as exc:
+        logger.warning(
+            "agent_final_attempt_failed duration_ms=%.1f error_type=%s",
+            (time.perf_counter() - started) * 1000,
+            type(exc).__name__,
+        )
+        return None
+
+    content = response.content if isinstance(response.content, str) else ""
+    finish_reason = _message_finish_reason(response)
+    logger.info(
+        "agent_final_attempt_complete duration_ms=%.1f finish_reason=%s output_chars=%s",
+        (time.perf_counter() - started) * 1000,
+        finish_reason or "unavailable",
+        len(content),
+    )
+    if not content.strip() or _message_was_truncated(response) or getattr(response, "tool_calls", None):
+        return None
+    return content.strip()
+
+
+def _mark_incomplete_answer(answer: str, reason: str) -> str:
+    warning_by_reason = {
+        "output_limit": "The model reached its response limit. The text below may be incomplete.",
+        "repeated_tool_call": "The agent stopped after repeating a source lookup. The text below may be incomplete.",
+        "recursion_limit": "The agent reached its tool-step limit. The text below may be incomplete.",
+    }
+    warning = warning_by_reason.get(reason, "The agent could not finish synthesizing a complete answer.")
+    body = (answer or "No complete answer was produced, but the request ended safely.").strip()
+    return f"{INCOMPLETE_RESPONSE_PREFIX}{warning}\n\n{body}"
+
+
 def run_agent(question: str, thread_id: str) -> dict:
     """
     Run the agent on a user question and return the final answer
@@ -503,6 +647,7 @@ def run_agent(question: str, thread_id: str) -> dict:
     # Invoke the agent with the user's question as a HumanMessage
     # Pass config with thread_id so the agent retains conversation history in this session
     request_started = time.perf_counter()
+    logger.info("agent_request_stage stage=graph_invoke_start")
     config = {
         "configurable": {"thread_id": thread_id},
         "callbacks": [_ModelTimingCallback()],
@@ -510,6 +655,7 @@ def run_agent(question: str, thread_id: str) -> dict:
     }
     # MemorySaver is process-local; prevent overlapping requests from racing a
     # shared checkpoint within this worker. Different sessions can still run.
+    graph_terminal = "complete"
     with _thread_lock(thread_id):
         _repair_incomplete_tool_history(agent, config)
         try:
@@ -517,7 +663,32 @@ def run_agent(question: str, thread_id: str) -> dict:
                 {"messages": [{"role": "user", "content": question}]},
                 config=config,
             )
-        except Exception:
+        except GraphRecursionError as exc:
+            graph_terminal = "recursion_limit"
+            logger.warning(
+                "agent_graph_terminated stage=recursion_limit error_type=%s",
+                type(exc).__name__,
+            )
+            _repair_incomplete_tool_history(agent, config)
+            snapshot = agent.get_state(config)
+            recovered_messages = (getattr(snapshot, "values", None) or {}).get("messages", [])
+            useful_evidence = any(
+                getattr(message, "type", None) == "tool"
+                and getattr(message, "status", None) != "error"
+                and bool(getattr(message, "content", ""))
+                for message in recovered_messages
+            )
+            partial_available = any(
+                getattr(message, "type", None) == "ai"
+                and not (getattr(message, "tool_calls", []) or [])
+                and bool(getattr(message, "content", ""))
+                for message in recovered_messages
+            )
+            if not useful_evidence and not partial_available:
+                raise
+            result = {"messages": recovered_messages}
+        except Exception as exc:
+            logger.warning("agent_graph_failed stage=invoke error_type=%s", type(exc).__name__)
             # The pre-model hook repairs persisted partial batches on every
             # model step. This boundary repair handles failures that escape
             # before LangGraph gets another chance to run that hook.
@@ -526,10 +697,32 @@ def run_agent(question: str, thread_id: str) -> dict:
             result = agent.invoke({"messages": []}, config=config)
 
     # ── Extract the final answer ───────────────────────────────────────────
-    # The last message in the conversation is the agent's final response
+    # The last message may be an output-limited draft, not a completed answer.
     messages = result["messages"]
     last_msg = messages[-1]
     final_answer = last_msg.content if last_msg.content else ""
+    response_reason = (
+        getattr(last_msg, "response_metadata", None) or {}
+    ).get("researchos_incomplete_reason")
+    if not response_reason and _message_was_truncated(last_msg):
+        response_reason = "output_limit"
+    if graph_terminal == "recursion_limit":
+        response_reason = "recursion_limit"
+
+    last_user_index = next(
+        (index for index in range(len(messages) - 1, -1, -1)
+         if getattr(messages[index], "type", None) == "human"
+         and str(getattr(messages[index], "content", "")).strip() == question.strip()),
+        0,
+    )
+    current_messages = messages[last_user_index:]
+    if response_reason:
+        recovered = _bounded_final_answer(question, current_messages, str(final_answer), response_reason)
+        if recovered:
+            final_answer = recovered
+            response_reason = None
+        else:
+            final_answer = _mark_incomplete_answer(str(final_answer), response_reason)
 
     # ── Extract reasoning steps (tool calls) ───────────────────────────────
     # Walk through all messages to find tool calls and their results.
@@ -538,12 +731,12 @@ def run_agent(question: str, thread_id: str) -> dict:
     steps = []
     tool_results = {}
 
-    for msg in messages:
+    for msg in current_messages:
         # Collect tool call results first (ToolMessage has tool_call_id)
         if msg.type == "tool":
             tool_results[msg.tool_call_id] = msg.content
 
-    for msg in messages:
+    for msg in current_messages:
         # AIMessages with tool_calls show what the agent decided to do
         if msg.type == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
             for tool_call in msg.tool_calls:
@@ -555,7 +748,10 @@ def run_agent(question: str, thread_id: str) -> dict:
                 steps.append(step)
 
     logger.info(
-        "agent_request_complete duration_ms=%.1f message_count=%s tool_call_count=%s",
+        "agent_request_terminal graph_state=%s finish_reason=%s incomplete=%s elapsed_ms=%.1f message_count=%s tool_call_count=%s",
+        graph_terminal,
+        _message_finish_reason(last_msg) or ("repeated_tool_call" if response_reason == "repeated_tool_call" else "unavailable"),
+        response_reason is not None,
         (time.perf_counter() - request_started) * 1000,
         len(messages),
         len(steps),
