@@ -441,7 +441,8 @@ class ApiCompatibilityTests(unittest.TestCase):
         client = TestClient(main.app)
         homepage = client.get("/")
         self.assertEqual(homepage.headers["cache-control"], "no-store, max-age=0")
-        self.assertIn("/static/app.js?v=2", homepage.text)
+        self.assertIn("/static/app.js?v=4", homepage.text)
+        self.assertIn("/static/review_markdown.js?v=2", homepage.text)
 
         with patch("main.generate_literature_review", return_value=review_data) as generate:
             response = client.post("/literature-review", json={"topic": topic})

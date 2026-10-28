@@ -1,6 +1,6 @@
 const $ = (selector) => document.querySelector(selector);
 const chatLog = $('#chat-log');
-const {removeRepositorySection, reviewToMarkdown} = window.reviewMarkdown;
+const {normalizeReviewData, removeRepositorySection, reviewToMarkdown} = window.reviewMarkdown;
 let revealObserver = null;
 let revealDelayIndex = 0;
 const observedRevealTargets = new WeakSet();
@@ -129,7 +129,55 @@ function el(tag, className, text) {
   return node;
 }
 
+function displayField(value, fallback) {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (Array.isArray(value)) {
+    const items = value.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim());
+    if (items.length) return items.join(', ');
+  }
+  return fallback;
+}
+
+function safeExternalUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    const parsed = new URL(value, window.location.href);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? parsed.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function renderReviewMarkdown(container, review, papers) {
+  const source = removeRepositorySection(review);
+  if (!source) {
+    container.textContent = 'No review text was included in the response. Retrieved paper records are shown above.';
+    return;
+  }
+
+  const linkedReview = source.replace(/\[(P\d+)\]/g, (citation, id) => {
+    const paper = papers.find((item) => item.citation_id === id);
+    const url = safeExternalUrl(paper?.url);
+    return url ? `[${id}](${url})` : citation;
+  });
+
+  try {
+    const parseMarkdown = window.marked?.parse;
+    const sanitizeHtml = window.DOMPurify?.sanitize;
+    if (typeof parseMarkdown !== 'function' || typeof sanitizeHtml !== 'function') {
+      container.textContent = linkedReview;
+      return;
+    }
+    // Model output is inserted only after passing through the HTML sanitizer.
+    container.innerHTML = sanitizeHtml(parseMarkdown(linkedReview));
+  } catch {
+    // Keep the report readable if a CDN renderer is unavailable or throws.
+    container.textContent = linkedReview;
+  }
+}
+
 function renderReview(data, markdown) {
+  data = normalizeReviewData(data);
   const results = $('#review-results');
   results.innerHTML = '';
   results.hidden = false;
@@ -151,57 +199,76 @@ function renderReview(data, markdown) {
   });
   header.append(download);
   results.append(header);
+  observeRevealTargets(header);
   const papersTitle = el('h4', '', `Retrieved papers (${data.papers.length})`);
   papersTitle.dataset.reveal = '';
   results.append(papersTitle);
+  observeRevealTargets(papersTitle);
   const grid = el('div', 'paper-grid');
-  data.papers.forEach((paper) => {
+  results.append(grid);
+  observeRevealTargets(grid);
+  data.papers.forEach((paper, index) => {
     const card = el('article', 'paper-card');
     card.dataset.reveal = '';
-    const link = el('a', '', `[${paper.citation_id || `P${data.papers.indexOf(paper) + 1}`}] ${paper.title}`);
-    if (paper.url) {
-      link.href = paper.url;
+    const citationId = displayField(paper.citation_id, `P${index + 1}`);
+    const title = displayField(paper.title, 'Title not provided');
+    const link = el('a', '', `[${citationId}] ${title}`);
+    const sourceUrl = safeExternalUrl(paper.url);
+    if (sourceUrl) {
+      link.href = sourceUrl;
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
     }
     card.append(link);
-    card.append(el('p', '', paper.abstract || 'No abstract available.'));
-    card.append(el('small', '', `${paper.authors?.join(', ') || 'Authors not listed'} · ${paper.published || 'Date not listed'} · ${paper.categories?.join(', ') || 'Categories not listed'}`));
+    card.append(el('p', '', displayField(paper.abstract, 'No abstract available.')));
+    card.append(el('small', '', `${displayField(paper.authors, 'Authors not listed')} · ${displayField(paper.published, 'Date not listed')} · ${displayField(paper.categories, 'Categories not listed')}`));
     grid.append(card);
+    observeRevealTargets(card);
   });
   if (!data.papers.length) grid.append(el('p', 'error-notes', 'No usable arXiv papers were found. Try a broader or reworded topic.'));
-  results.append(grid);
   if (data.review) {
     const structuredTitle = el('h4', '', 'Structured review');
     structuredTitle.dataset.reveal = '';
     results.append(structuredTitle);
     const reviewContent = el('div', 'review-markdown');
     reviewContent.dataset.reveal = '';
-    const linkedReview = removeRepositorySection(data.review).replace(/\[(P\d+)\]/g, (citation, id) => {
-      const paper = data.papers.find((item) => item.citation_id === id);
-      return paper?.url ? `[${id}](${paper.url})` : citation;
-    });
-    const renderedHtml = marked.parse(linkedReview);
-    reviewContent.innerHTML = DOMPurify.sanitize(renderedHtml);
+    renderReviewMarkdown(reviewContent, data.review, data.papers);
     results.append(reviewContent);
+    observeRevealTargets(structuredTitle);
+    observeRevealTargets(reviewContent);
+  } else {
+    const missingReview = el('div', 'review-markdown', 'No review text was returned. Retrieved paper records are shown above.');
+    missingReview.dataset.reveal = '';
+    results.append(el('h4', '', 'Structured review'));
+    results.append(missingReview);
+    observeRevealTargets(missingReview);
   }
   const repositoriesTitle = el('h4', '', `Related GitHub repositories (${data.repositories.length})`);
   repositoriesTitle.dataset.reveal = '';
   results.append(repositoriesTitle);
+  observeRevealTargets(repositoriesTitle);
   results.append(el('p', 'error-notes', 'Topic-search results; no direct relationship to a listed paper is established.'));
   const repoList = el('div', 'repo-list');
   repoList.dataset.reveal = '';
   data.repositories.forEach((repo) => {
     const row = document.createElement('div');
-    const link = el('a', '', repo.name);
-    link.href = repo.url;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    row.append(link, document.createTextNode(` — ${repo.description || 'No description'} · ${repo.stars ?? 'Stars unavailable'} stars`));
+    const repoName = displayField(repo.name, 'Unnamed repository');
+    const link = el('a', '', repoName);
+    const repoUrl = safeExternalUrl(repo.url);
+    if (repoUrl) {
+      link.href = repoUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      row.append(link);
+    } else {
+      row.append(document.createTextNode(repoName));
+    }
+    row.append(document.createTextNode(` — ${displayField(repo.description, 'No description')} · ${repo.stars ?? 'Stars unavailable'} stars`));
     repoList.append(row);
   });
   if (!data.repositories.length) repoList.textContent = 'No matching repositories were returned.';
   results.append(repoList);
+  observeRevealTargets(repoList);
   const notices = Object.entries(data.errors || {}).filter(([, value]) => value).map(([key, value]) => `${key}: ${value}`);
   if (notices.length) {
     const notice = el('p', 'error-notes', `Some sources were unavailable: ${notices.join(' · ')}`);
@@ -223,8 +290,9 @@ $('#review-form').addEventListener('submit', async (event) => {
       method: 'POST', cache: 'no-store',
       headers: {'Content-Type': 'application/json'}, body: JSON.stringify({topic})
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
+    const responseData = await response.json();
+    if (!response.ok) throw new Error(responseData?.detail || `Request failed (${response.status})`);
+    const data = normalizeReviewData(responseData);
     const markdownForResponse = reviewToMarkdown(data);
     renderReview(data, markdownForResponse);
     status.textContent = data.errors?.synthesis

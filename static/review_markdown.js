@@ -1,4 +1,21 @@
 (function exposeReviewMarkdown(root) {
+  function normalizeReviewData(data) {
+    const source = data && typeof data === 'object' ? data : {};
+    const asRecords = (value) => Array.isArray(value)
+      ? value.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+      : [];
+    return {
+      ...source,
+      topic: typeof source.topic === 'string' && source.topic.trim() ? source.topic.trim() : 'Research topic',
+      review: typeof source.review === 'string' ? source.review : '',
+      papers: asRecords(source.papers),
+      repositories: asRecords(source.repositories),
+      errors: source.errors && typeof source.errors === 'object' && !Array.isArray(source.errors)
+        ? source.errors
+        : {},
+    };
+  }
+
   function removeRepositorySection(review) {
     return String(review || '')
       .replace(/(?:^|\n)## Related GitHub repositories\s*\n[\s\S]*?(?=\n##\s|$)/gi, '')
@@ -10,6 +27,7 @@
   }
 
   function reviewToMarkdown(data) {
+    data = normalizeReviewData(data);
     const report = removeRepositorySection(data.review);
     const lines = [
       `# Literature review: ${data.topic}`,
@@ -24,14 +42,18 @@
     if (!data.papers.length) lines.push('_No papers were returned by arXiv._', '');
     data.papers.forEach((paper, index) => {
       lines.push(
-        `### [${paper.citation_id || `P${index + 1}`}] ${paper.title}`,
+        `### [${paper.citation_id || `P${index + 1}`}] ${paper.title || 'Title not provided'}`,
         '',
-        `- **Authors:** ${paper.authors?.length ? paper.authors.map(escapeMarkdown).join(', ') : 'Not listed'}`,
+        `- **Authors:** ${Array.isArray(paper.authors) && paper.authors.length
+          ? paper.authors.map(escapeMarkdown).join(', ')
+          : typeof paper.authors === 'string' && paper.authors.trim() ? escapeMarkdown(paper.authors) : 'Not listed'}`,
         `- **Published:** ${paper.published || 'Not listed'}`,
-        `- **Categories:** ${paper.categories?.length ? paper.categories.join(', ') : 'Not listed'}`,
+        `- **Categories:** ${Array.isArray(paper.categories) && paper.categories.length
+          ? paper.categories.map(escapeMarkdown).join(', ')
+          : typeof paper.categories === 'string' && paper.categories.trim() ? escapeMarkdown(paper.categories) : 'Not listed'}`,
         `- **Source:** ${paper.url ? `[arXiv](${paper.url})` : 'URL not available'}`,
         '',
-        paper.abstract || '_No abstract available._',
+        typeof paper.abstract === 'string' && paper.abstract.trim() ? paper.abstract : '_No abstract available._',
         '',
       );
     });
@@ -43,12 +65,18 @@
     );
     if (!data.repositories.length) lines.push('_No repositories were returned._', '');
     data.repositories.forEach((repo) => {
-      lines.push(`- [${repo.name}](${repo.url}) — ${repo.description || 'No description'} (${repo.stars ?? 'Stars unavailable'} stars)`);
+      const name = typeof repo.name === 'string' && repo.name.trim() ? repo.name : 'Unnamed repository';
+      const description = typeof repo.description === 'string' && repo.description.trim()
+        ? repo.description
+        : 'No description';
+      lines.push(repo.url
+        ? `- [${name}](${repo.url}) — ${description} (${repo.stars ?? 'Stars unavailable'} stars)`
+        : `- ${name} — ${description} (${repo.stars ?? 'Stars unavailable'} stars)`);
     });
     return lines.join('\n');
   }
 
-  const api = {removeRepositorySection, reviewToMarkdown};
+  const api = {normalizeReviewData, removeRepositorySection, reviewToMarkdown};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.reviewMarkdown = api;
 })(globalThis);
