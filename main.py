@@ -12,9 +12,12 @@ conversation history, allowing the agent to understand follow-up questions.
 Run with: uvicorn main:app --reload
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from agent import run_agent
+from agent import run_agent, generate_literature_review
+from pathlib import Path
 import uuid
 from typing import Optional
 
@@ -24,6 +27,8 @@ app = FastAPI(
     description="A research assistant powered by LangGraph ReAct agent with web search.",
     version="1.0.0",
 )
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ── Request / Response Schemas ─────────────────────────────────────────────────
@@ -108,8 +113,16 @@ class AnswerResponse(BaseModel):
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/")
+def homepage():
+    """Serve the browser-based research assistant."""
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/health")
 def health_check():
-    """Simple health check — useful for verifying the server is running."""
     return {"status": "ok", "message": "Agentic Research Assistant is running."}
 
 
@@ -145,3 +158,22 @@ def ask_question(request: QuestionRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+
+
+class LiteratureReviewRequest(BaseModel):
+    topic: str = Field(..., min_length=3, max_length=500)
+
+    class Config:
+        str_strip_whitespace = True
+
+
+@app.post("/literature-review")
+def literature_review(request: LiteratureReviewRequest, response: Response):
+    """Build a source-grounded literature review from arXiv and GitHub records."""
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    if not request.topic.strip():
+        raise HTTPException(status_code=400, detail="Topic cannot be empty.")
+    try:
+        return generate_literature_review(request.topic)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Literature review failed: {exc}")

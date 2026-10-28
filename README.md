@@ -115,7 +115,7 @@ To start a new conversation (clearing history), simply refresh the browser page.
 | Agent Framework  | LangGraph (`create_react_agent`)                 |
 | LLM              | Llama 3.3 70B via Groq (ChatGroq)               |
 | Tools            | DuckDuckGo Search, GitHub REST API, arXiv API    |
-| Frontend         | Streamlit                                        |
+| Frontend         | Static HTML/CSS/JS served by FastAPI; Streamlit fallback |
 | Env Management   | python-dotenv                                    |
 
 ## Project Structure
@@ -125,6 +125,7 @@ agentic-research-assistant/
 ├── main.py              # FastAPI app with /ask endpoint
 ├── agent.py             # LangGraph agent (LLM + tools + create_react_agent)
 ├── streamlit_app.py     # Streamlit UI (input, answer, reasoning trace)
+├── static/              # Browser UI (index.html, styles.css, app.js)
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Template for environment variables
 ├── .gitignore           # Excludes .env and Python artifacts
@@ -167,13 +168,21 @@ cp .env.example .env
 # Get a free key at: https://console.groq.com/keys
 ```
 
-### 5. Start the FastAPI backend
+### 5. Start the FastAPI backend and browser UI
 
 ```bash
 uvicorn main:app --reload
 ```
 
-The API will be live at `http://localhost:8000`. You can test it at `http://localhost:8000/docs` (Swagger UI).
+The browser UI and API will be live at `http://localhost:8000`. API docs are at `http://localhost:8000/docs` (Swagger UI), and the health check is `http://localhost:8000/health`.
+
+The browser UI includes a research chat (`POST /ask`) and a Literature Review Generator (`POST /literature-review`). The latter ranks arXiv candidates by topic-term overlap in titles and abstracts, then selects up to five records. The generated review separates abstract evidence from interpretation and labels gaps as candidates limited by the small, search-dependent sample. Citation IDs refer to the returned paper records; this checks reference mapping, not whether every sentence is supported by its citation. GitHub results are related topic-search repositories unless a paper-to-repository link is explicitly evidenced. The result can be downloaded as Markdown. If synthesis fails validation, the fallback presents retrieved abstracts and metadata without inventing comparisons or gaps.
+
+Run the offline literature-review tests with:
+
+```bash
+python -m unittest discover -s tests
+```
 
 ### 6. Start the Streamlit frontend (new terminal)
 
@@ -183,9 +192,17 @@ streamlit run streamlit_app.py
 
 The UI will open at `http://localhost:8501`.
 
+## Streamlit Fallback
+
+The original Streamlit interface remains available in a separate terminal:
+
+```bash
+streamlit run streamlit_app.py
+```
+
 ## Usage
 
-1. Open the Streamlit UI in your browser
+1. Open `http://localhost:8000` in your browser (or use the Streamlit fallback)
 2. Type a question (e.g., "What are the latest breakthroughs in fusion energy?")
 3. Click **Ask the Agent**
 4. See the agent's answer and expand the reasoning trace to see which web searches it performed
