@@ -20,6 +20,8 @@ class WebSearchReliabilityTests(unittest.TestCase):
         self.assertEqual(agent.llm.model_name, "openai/gpt-oss-20b")
         self.assertEqual(agent.llm.max_tokens, 900)
         self.assertEqual(agent.llm.max_retries, 1)
+        self.assertEqual(agent.WEB_SEARCH_BACKENDS, "auto")
+        self.assertEqual(agent.WEB_SEARCH_ATTEMPTS, 1)
 
     def test_model_metrics_log_duration_and_available_token_counts_without_prompt_text(self):
         callback = agent._ModelTimingCallback()
@@ -66,9 +68,10 @@ class WebSearchReliabilityTests(unittest.TestCase):
 
         self.assertEqual(ddgs.call_count, agent.WEB_SEARCH_ATTEMPTS)
         self.assertTrue(all(call.kwargs == {"timeout": agent.WEB_SEARCH_TIMEOUT_SECONDS} for call in ddgs.call_args_list))
-        self.assertEqual(attempted_backends, ["duckduckgo,yahoo"] * agent.WEB_SEARCH_ATTEMPTS)
-        self.assertEqual(sleep.call_count, agent.WEB_SEARCH_ATTEMPTS - 1)
+        self.assertEqual(attempted_backends, ["auto"] * agent.WEB_SEARCH_ATTEMPTS)
+        self.assertEqual(sleep.call_count, 0)
         self.assertIn("Web search is unavailable", result)
+        self.assertIn("1 attempt(s)", result)
         self.assertIn("No web results were retrieved", result)
         self.assertNotIn("provider request timed out", result)
 

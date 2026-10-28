@@ -108,8 +108,10 @@ GROQ_MODEL = "openai/gpt-oss-20b"
 
 # ── Tool Setup ─────────────────────────────────────────────────────────────────
 WEB_SEARCH_TIMEOUT_SECONDS = 5
-WEB_SEARCH_ATTEMPTS = 2
-WEB_SEARCH_BACKENDS = "duckduckgo,yahoo"
+# DDGS recommends auto selection so a temporary outage in one engine can fall
+# through to another. Keep one bounded DDGS request; it handles engine fallback.
+WEB_SEARCH_ATTEMPTS = 1
+WEB_SEARCH_BACKENDS = "auto"
 TOOL_RESULT_MAX_CHARS = 2000
 RETRIEVED_ABSTRACT_MAX_CHARS = 5000
 
@@ -169,7 +171,7 @@ def web_search(query: str) -> str:
                 time.sleep(0.25 * attempt)
             else:
                 return (
-                    "Web search is unavailable after two attempts "
+                    f"Web search is unavailable after {WEB_SEARCH_ATTEMPTS} attempt(s) "
                     f"({type(exc).__name__}). No web results were retrieved. "
                     "Continue with other relevant research tools, and do not present this as a successful search."
                 )
@@ -308,7 +310,9 @@ SYSTEM_PROMPT = (
     "When answering questions, use the web search tool if needed for recent or specific information, "
     "use the arxiv_tool when searching for academic papers, scientific articles, or research publications, "
     "or use the github_repo_info tool when asked about GitHub repositories. "
-    "Always provide a well-structured, clear, and comprehensive final response directly addressing the user. "
+    "Keep final answers concise and directly address the user. For broad comparison questions, use this fixed structure: "
+    "a brief introduction, a compact Markdown table with at most four comparison rows, and a practical recommendation. "
+    "Avoid long exhaustive tables and lists. "
     "If a tool reports an error or no results, do not describe that tool as successful or invent results. "
     "Continue with other relevant tools when possible and disclose unavailable sources. "
     "Do not output raw internal thinking or scratchpad notes in your final answer."
@@ -550,8 +554,8 @@ def _repair_incomplete_tool_history(graph, config: dict) -> int:
     return len(pending)
 
 
-CHAT_FINAL_ATTEMPT_MAX_TOKENS = 650
-CHAT_FINAL_ATTEMPT_MAX_CHARS = 6500
+CHAT_FINAL_ATTEMPT_MAX_TOKENS = 280
+CHAT_FINAL_ATTEMPT_MAX_CHARS = 3200
 INCOMPLETE_RESPONSE_PREFIX = "⚠ Incomplete response: "
 
 
@@ -570,23 +574,39 @@ def _message_was_truncated(message) -> bool:
     return isinstance(output_tokens, int) and output_tokens >= CHAT_MODEL_MAX_TOKENS
 
 
-def _bounded_final_answer(question: str, messages: list, partial_answer: str, reason: str) -> str | None:
+def _message_text(message) -> str:
+    """Extract visible text from string or block-based model content."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "\n".join(part for part in parts if part.strip()).strip()
+    return ""
+
+
+def _bounded_final_answer(question: str, messages: list, partial_answer: str, reason: str) -> tuple[str, bool] | None:
     """Make one concise no-tools final-answer attempt from collected evidence."""
     evidence = []
     for message in messages:
         if getattr(message, "type", None) != "tool" or getattr(message, "status", None) == "error":
             continue
-        content = str(getattr(message, "content", "") or "").strip()
+        content = _message_text(message)
         if content:
             evidence.append(content[:500])
-    evidence_text = "\n\n".join(f"Source result {index + 1}: {item}" for index, item in enumerate(evidence[-6:]))
+    evidence_text = "\n\n".join(f"Source result {index + 1}: {item}" for index, item in enumerate(evidence[-4:]))
     prompt = (
-        "Write a concise, complete final answer to the user's question using only the partial answer and source results below. "
-        "The previous agent stopped before completion. Do not call tools or claim missing evidence. Prefer a short comparison "
-        "over a long table. Keep the answer under 450 words.\n\n"
-        f"User question:\n{question[:1400]}\n\n"
+        "Finish the user's answer in at most 160 words using only the evidence below. Do not call tools. "
+        "For a comparison, output one brief introduction, a compact table with no more than three rows, "
+        "and one practical recommendation. Do not repeat the partial text verbatim if it is cut off.\n\n"
+        f"Question: {question[:500]}\n\n"
         f"Source results collected:\n{evidence_text or 'No successful tool results were collected.'}\n\n"
-        f"Partial answer, if any:\n{(partial_answer or '')[:1800]}"
+        f"Partial answer (may end abruptly):\n{(partial_answer or '')[:900]}"
     )[:CHAT_FINAL_ATTEMPT_MAX_CHARS]
     started = time.perf_counter()
     logger.info("agent_request_stage stage=bounded_final_attempt reason=%s", reason)
@@ -604,7 +624,7 @@ def _bounded_final_answer(question: str, messages: list, partial_answer: str, re
         )
         return None
 
-    content = response.content if isinstance(response.content, str) else ""
+    content = _message_text(response)
     finish_reason = _message_finish_reason(response)
     logger.info(
         "agent_final_attempt_complete duration_ms=%.1f finish_reason=%s output_chars=%s",
@@ -612,9 +632,10 @@ def _bounded_final_answer(question: str, messages: list, partial_answer: str, re
         finish_reason or "unavailable",
         len(content),
     )
-    if not content.strip() or _message_was_truncated(response) or getattr(response, "tool_calls", None):
+    if not content.strip():
         return None
-    return content.strip()
+    complete = not _message_was_truncated(response) and not getattr(response, "tool_calls", None)
+    return content.strip(), complete
 
 
 def _mark_incomplete_answer(answer: str, reason: str) -> str:
@@ -700,15 +721,6 @@ def run_agent(question: str, thread_id: str) -> dict:
     # The last message may be an output-limited draft, not a completed answer.
     messages = result["messages"]
     last_msg = messages[-1]
-    final_answer = last_msg.content if last_msg.content else ""
-    response_reason = (
-        getattr(last_msg, "response_metadata", None) or {}
-    ).get("researchos_incomplete_reason")
-    if not response_reason and _message_was_truncated(last_msg):
-        response_reason = "output_limit"
-    if graph_terminal == "recursion_limit":
-        response_reason = "recursion_limit"
-
     last_user_index = next(
         (index for index in range(len(messages) - 1, -1, -1)
          if getattr(messages[index], "type", None) == "human"
@@ -716,11 +728,37 @@ def run_agent(question: str, thread_id: str) -> dict:
         0,
     )
     current_messages = messages[last_user_index:]
+    response_reason = (getattr(last_msg, "response_metadata", None) or {}).get(
+        "researchos_incomplete_reason"
+    )
+    truncated_msg = next(
+        (message for message in reversed(current_messages)
+         if getattr(message, "type", None) == "ai" and _message_was_truncated(message)),
+        None,
+    )
+    if not response_reason and truncated_msg:
+        response_reason = "output_limit"
+    final_answer = _message_text(last_msg)
+    # Some provider limit responses carry finish_reason=length but an empty
+    # final content. Preserve the latest earlier assistant draft in that case.
+    if not final_answer:
+        final_answer = next(
+            (_message_text(message) for message in reversed(current_messages)
+             if getattr(message, "type", None) == "ai" and _message_text(message)),
+            "",
+        )
+    if graph_terminal == "recursion_limit":
+        response_reason = "recursion_limit"
+
     if response_reason:
         recovered = _bounded_final_answer(question, current_messages, str(final_answer), response_reason)
         if recovered:
-            final_answer = recovered
-            response_reason = None
+            final_answer, completed = recovered
+            if completed:
+                response_reason = None
+            else:
+                final_answer = _mark_incomplete_answer(final_answer, "output_limit")
+                response_reason = "output_limit"
         else:
             final_answer = _mark_incomplete_answer(str(final_answer), response_reason)
 
