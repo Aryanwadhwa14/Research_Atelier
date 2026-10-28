@@ -18,7 +18,7 @@ import agent
 class WebSearchReliabilityTests(unittest.TestCase):
     def test_groq_configuration_uses_bounded_output_timeout_and_retry(self):
         self.assertEqual(agent.llm.model_name, "openai/gpt-oss-20b")
-        self.assertEqual(agent.llm.max_tokens, 900)
+        self.assertEqual(agent.llm.max_tokens, 700)
         self.assertEqual(agent.llm.max_retries, 1)
         self.assertEqual(agent.WEB_SEARCH_BACKENDS, "auto")
         self.assertEqual(agent.WEB_SEARCH_ATTEMPTS, 1)

@@ -62,10 +62,60 @@ function observeRevealTargets(root) {
   });
 }
 
+const CHAT_MARKDOWN_TAGS = new Set([
+  'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'HR', 'I', 'LI', 'OL', 'P', 'PRE', 'S', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TH',
+  'THEAD', 'TR', 'UL'
+]);
+const CHAT_MARKDOWN_DROP_TAGS = new Set(['EMBED', 'FORM', 'IFRAME', 'MATH', 'OBJECT', 'SCRIPT', 'STYLE', 'SVG', 'TEMPLATE']);
+
+function appendSanitizedMarkdownNode(parent, sourceNode) {
+  if (sourceNode.nodeType === 3) {
+    parent.append(document.createTextNode(sourceNode.nodeValue || ''));
+    return;
+  }
+  if (sourceNode.nodeType !== 1) return;
+  const tag = sourceNode.tagName.toUpperCase();
+  if (CHAT_MARKDOWN_DROP_TAGS.has(tag)) return;
+  if (!CHAT_MARKDOWN_TAGS.has(tag)) {
+    [...sourceNode.childNodes].forEach((child) => appendSanitizedMarkdownNode(parent, child));
+    return;
+  }
+
+  const safeNode = document.createElement(tag.toLowerCase());
+  if (tag === 'A') {
+    const href = safeExternalUrl(sourceNode.getAttribute('href'));
+    if (href) {
+      safeNode.setAttribute('href', href);
+      safeNode.setAttribute('target', '_blank');
+      safeNode.setAttribute('rel', 'noopener noreferrer');
+    }
+  }
+  [...sourceNode.childNodes].forEach((child) => appendSanitizedMarkdownNode(safeNode, child));
+  parent.append(safeNode);
+}
+
+function renderChatMarkdown(container, markdown) {
+  try {
+    const parseMarkdown = window.marked?.parse;
+    if (typeof parseMarkdown !== 'function' || typeof DOMParser !== 'function') return false;
+    const parsed = new DOMParser().parseFromString(parseMarkdown(markdown), 'text/html');
+    const fragment = document.createDocumentFragment();
+    [...parsed.body.childNodes].forEach((child) => appendSanitizedMarkdownNode(fragment, child));
+    container.replaceChildren(fragment);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function addMessage(text, role, meta = '') {
   const node = document.createElement('div');
   node.className = `message ${role}`;
-  node.textContent = text;
+  const content = document.createElement('div');
+  content.className = 'message-content';
+  if (!role.startsWith('assistant') || !renderChatMarkdown(content, text)) content.textContent = text;
+  node.append(content);
   if (meta) {
     const detail = document.createElement('small');
     detail.className = 'message-meta';

@@ -5,18 +5,26 @@ const vm = require('node:vm');
 
 function makeElement(tag = 'div') {
   const listeners = new Map();
+  const attributes = new Map();
   const node = {
     tagName: tag,
+    nodeType: tag === 'fragment' ? 11 : 1,
     className: '',
     classList: {add() {}, remove() {}, toggle() {}},
     children: [],
     dataset: {},
     value: '',
-    textContent: '',
+    _textContent: '',
+    get textContent() { return this._textContent + this.children.map((child) => child.textContent || '').join(''); },
+    set textContent(value) { this._textContent = String(value); this.children = []; },
     style: {setProperty() {}},
     addEventListener(name, callback) { listeners.set(name, callback); },
     getListener(name) { return listeners.get(name); },
-    append(...items) { items.forEach((item) => { item.parentNode = this; this.children.push(item); }); },
+    append(...items) { items.forEach((item) => {
+      if (item.nodeType === 11) this.children.push(...item.children);
+      else { item.parentNode = this; this.children.push(item); }
+    }); },
+    replaceChildren(...items) { this.children = []; this.append(...items); },
     remove() {
       if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((child) => child !== this);
     },
@@ -25,7 +33,8 @@ function makeElement(tag = 'div') {
       return null;
     },
     querySelectorAll() { return []; },
-    setAttribute() {},
+    setAttribute(name, value) { attributes.set(name, value); },
+    getAttribute(name) { return attributes.get(name) || null; },
     focus() {},
     requestSubmit() { return this.getListener('submit')?.({preventDefault() {}}); },
     scrollIntoView() {},
@@ -36,7 +45,18 @@ function makeElement(tag = 'div') {
   return node;
 }
 
-async function runChatRequest(fetchImpl, timers = {}) {
+function sourceNode(tagName, attrs = {}, children = []) {
+  return {
+    nodeType: 1,
+    tagName: tagName.toUpperCase(),
+    childNodes: children,
+    getAttribute(name) { return attrs[name] || null; },
+  };
+}
+
+function textNode(text) { return {nodeType: 3, nodeValue: text}; }
+
+async function runChatRequest(fetchImpl, timers = {}, markdownEnabled = true) {
   const elements = new Map([
     ['#chat-log', makeElement()], ['#chat-form', makeElement('form')],
     ['#chat-input', makeElement('textarea')], ['#new-chat', makeElement('button')],
@@ -52,10 +72,12 @@ async function runChatRequest(fetchImpl, timers = {}) {
     querySelector(selector) { return elements.get(selector) || null; },
     querySelectorAll() { return []; },
     createElement: makeElement,
-    createTextNode(text) { return {textContent: text}; },
+    createTextNode(text) { return {nodeType: 3, textContent: text, children: []}; },
+    createDocumentFragment() { return makeElement('fragment'); },
   };
   const window = {
     reviewMarkdown: {normalizeReviewData() {}, removeRepositorySection() {}, reviewToMarkdown() {}},
+    ...(markdownEnabled ? {marked: {parse: (value) => value}} : {}),
     matchMedia() { return {matches: true, addEventListener() {}}; },
     location: {href: 'https://researchos.test/'},
     addEventListener() {},
@@ -66,6 +88,18 @@ async function runChatRequest(fetchImpl, timers = {}) {
     localStorage: {getItem() { return null; }, setItem() {}},
     crypto: {randomUUID: () => 'thread-test'},
     URL, Blob, Date, console,
+    ...(markdownEnabled ? {DOMParser: class {
+      parseFromString(markdown) {
+        const link = String(markdown).match(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/);
+        return {body: {childNodes: [sourceNode('p', {}, [
+          sourceNode('strong', {}, [textNode('Recent approaches')]),
+          textNode(' Milvus needs ops effort, complex '),
+          ...(link ? [sourceNode('a', {href: link[2]}, [textNode(link[1])])] : []),
+          sourceNode('script', {}, [textNode('alert(1)')]),
+          sourceNode('a', {href: 'javascript:alert(1)'}, [textNode('unsafe link')]),
+        ])]}};
+      }
+    }} : {}),
     setTimeout: timers.setTimeout || setTimeout,
     clearTimeout: timers.clearTimeout || clearTimeout,
   };
@@ -78,13 +112,29 @@ async function runChatRequest(fetchImpl, timers = {}) {
 (async () => {
   const completed = await runChatRequest(async () => ({
     ok: true,
-    async json() { return {answer: '⚠ Incomplete response: The text may be incomplete.\n\nMilvus needs ops effort, complex', steps: [{}, {}], thread_id: 'thread-test'}; },
+    async json() { return {answer: '⚠ Incomplete response: The text may be incomplete.\n\n**Recent approaches**\n\n[Paper source](https://example.org/paper)', steps: [{}, {}], thread_id: 'thread-test'}; },
   }));
   assert.equal(completed.some((node) => node.className === 'typing'), false);
   const partial = completed.find((node) => node.className === 'message assistant incomplete');
   assert.ok(partial);
   assert.match(partial.textContent, /Milvus needs ops effort, complex/);
-  assert.match(partial.children[0].textContent, /2 tool call\(s\) attempted/);
+  const renderedParagraph = partial.children[0].children[0];
+  assert.ok(renderedParagraph.children.some((node) => node.tagName === 'strong'));
+  assert.equal(renderedParagraph.children.some((node) => node.tagName === 'script'), false);
+  const safeLink = renderedParagraph.children.find((node) => node.tagName === 'a');
+  assert.equal(safeLink.getAttribute('href'), 'https://example.org/paper');
+  const unsafeLink = renderedParagraph.children.filter((node) => node.tagName === 'a')[1];
+  assert.equal(unsafeLink.getAttribute('href'), null);
+  const incompleteMeta = partial.children.find((node) => node.className === 'message-meta');
+  assert.match(incompleteMeta.textContent, /2 tool call\(s\) attempted/);
+
+  const plainFallback = await runChatRequest(async () => ({
+    ok: true,
+    async json() { return {answer: '**Plain Markdown fallback**', steps: [], thread_id: 'thread-test'}; },
+  }), {}, false);
+  const plainAssistant = plainFallback.find((node) => node.className === 'message assistant');
+  assert.match(plainAssistant.textContent, /\*\*Plain Markdown fallback\*\*/);
+  assert.equal(plainAssistant.children[0].children.length, 0);
 
   const networkError = await runChatRequest(async () => { throw new TypeError('Failed to fetch'); });
   assert.equal(networkError.some((node) => node.className === 'typing'), false);

@@ -56,7 +56,7 @@ class ChatCompletionTests(unittest.TestCase):
         def vector_db_lookup(query: str) -> str:
             """Return controlled comparison evidence."""
             executed.append(query)
-            return "Milvus scales well but needs operational expertise. Qdrant offers a simpler managed experience."
+            return "For vector databases, Milvus scales well but needs operational expertise. Qdrant offers a simpler managed experience. [Milvus docs](https://example.org/milvus)"
 
         first = AIMessage(content="", tool_calls=[{
             "name": "vector_db_lookup", "args": {"query": "vector database trade-offs"},
@@ -80,12 +80,14 @@ class ChatCompletionTests(unittest.TestCase):
             result = agent.run_agent("Compare vector databases", "truncated-final-test")
 
         self.assertEqual(executed, ["vector database trade-offs"])
-        self.assertEqual(result["answer"], final.content)
+        self.assertIn(final.content, result["answer"])
         self.assertEqual(len(result["steps"]), 1)
         self.assertEqual(model.invoke.call_count, 1)
         self.assertIn("Milvus scales well", model.invoke.call_args.args[0])
         self.assertEqual(model.invoke.call_args.kwargs["max_tokens"], agent.CHAT_FINAL_ATTEMPT_MAX_TOKENS)
         self.assertLessEqual(len(model.invoke.call_args.args[0]), agent.CHAT_FINAL_ATTEMPT_MAX_CHARS)
+        self.assertIn("**Sources**", result["answer"])
+        self.assertIn("[Milvus docs](https://example.org/milvus)", result["answer"])
 
     def test_failed_bounded_completion_preserves_partial_with_warning(self):
         class EmptyGraph:
@@ -109,6 +111,7 @@ class ChatCompletionTests(unittest.TestCase):
         self.assertTrue(result["answer"].startswith(agent.INCOMPLETE_RESPONSE_PREFIX))
         self.assertIn("Milvus requires ops effort, complex", result["answer"])
         self.assertIn("may be incomplete", result["answer"])
+        self.assertNotIn("https://", result["answer"])
 
     def test_truncated_bounded_completion_preserves_its_partial_with_warning(self):
         class EmptyGraph:
@@ -163,7 +166,7 @@ class ChatCompletionTests(unittest.TestCase):
         self.assertEqual(len(result["steps"]), 1)
 
     def test_truncation_detection_uses_finish_reason_and_token_count(self):
-        self.assertIn("compact Markdown table", agent.SYSTEM_PROMPT)
+        self.assertIn("compact table", agent.SYSTEM_PROMPT)
         self.assertIn("practical recommendation", agent.SYSTEM_PROMPT)
         self.assertTrue(agent._message_was_truncated(AIMessage(
             content="partial", response_metadata={"finish_reason": "length"}

@@ -32,7 +32,7 @@ from langgraph.errors import GraphRecursionError
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-CHAT_MODEL_MAX_TOKENS = 900
+CHAT_MODEL_MAX_TOKENS = 700
 
 # ── LLM Setup ──────────────────────────────────────────────────────────────────
 # ChatGroq wraps the Groq API. We use openai/gpt-oss-20b for fast inference,
@@ -306,13 +306,15 @@ tools = [web_search, github_repo_info, arxiv_tool]
 
 # System prompt to ensure clean, structured answers
 SYSTEM_PROMPT = (
-    "You are a helpful and thorough research assistant. "
+    "You are a helpful research assistant. "
     "When answering questions, use the web search tool if needed for recent or specific information, "
     "use the arxiv_tool when searching for academic papers, scientific articles, or research publications, "
     "or use the github_repo_info tool when asked about GitHub repositories. "
-    "Keep final answers concise and directly address the user. For broad comparison questions, use this fixed structure: "
-    "a brief introduction, a compact Markdown table with at most four comparison rows, and a practical recommendation. "
-    "Avoid long exhaustive tables and lists. "
+    "For broad research questions, aim for 250 to 400 words, with a short introduction, a few focused points, and a brief conclusion. "
+    "Use a small Markdown comparison table only when it makes a comparison clearer. For broad comparisons, use a brief introduction, "
+    "a compact table with at most four rows, and a practical recommendation. Avoid exhaustive tables and lists. "
+    "When a tool provides a source URL, cite its exact title and URL as a Markdown link near the related claim. "
+    "Do not invent paper names, authors, dates, metrics, citations, or URLs. Clearly call unsupported recent statements general background. "
     "If a tool reports an error or no results, do not describe that tool as successful or invent results. "
     "Continue with other relevant tools when possible and disclose unavailable sources. "
     "Do not output raw internal thinking or scratchpad notes in your final answer."
@@ -554,7 +556,7 @@ def _repair_incomplete_tool_history(graph, config: dict) -> int:
     return len(pending)
 
 
-CHAT_FINAL_ATTEMPT_MAX_TOKENS = 280
+CHAT_FINAL_ATTEMPT_MAX_TOKENS = 500
 CHAT_FINAL_ATTEMPT_MAX_CHARS = 3200
 INCOMPLETE_RESPONSE_PREFIX = "⚠ Incomplete response: "
 
@@ -590,23 +592,86 @@ def _message_text(message) -> str:
     return ""
 
 
-def _bounded_final_answer(question: str, messages: list, partial_answer: str, reason: str) -> tuple[str, bool] | None:
-    """Make one concise no-tools final-answer attempt from collected evidence."""
-    evidence = []
+_CHAT_STOPWORDS = {
+    "about", "after", "also", "and", "are", "for", "from", "how", "into", "latest", "more", "most",
+    "the", "their", "this", "through", "what", "when", "where", "which", "with",
+}
+
+
+def _relevant_tool_messages(question: str, messages: list, limit: int = 4) -> list:
+    """Select the most question-relevant successful tool results for finalization."""
+    terms = {
+        term for term in re.findall(r"[a-z0-9]+", (question or "").lower())
+        if len(term) > 2 and term not in _CHAT_STOPWORDS
+    }
+    candidates = []
+    for index, message in enumerate(messages):
+        if getattr(message, "type", None) != "tool" or getattr(message, "status", None) == "error":
+            continue
+        content = _message_text(message)
+        if not content or content.lower().startswith(("web search is unavailable", "error fetching", "error:")):
+            continue
+        score = sum(term in content.lower() for term in terms)
+        if score:
+            candidates.append((score, index, message))
+    return [item[2] for item in sorted(candidates, key=lambda item: (item[0], item[1]), reverse=True)[:limit]]
+
+
+def _tool_source_links(messages: list, limit: int = 6) -> list[tuple[str, str]]:
+    """Extract only HTTP(S) URLs and labels actually present in tool results."""
+    markdown_link = re.compile(r"\[([^\]]{1,180})\]\((https?://[^\s)]+)\)")
+    title_and_url = re.compile(r"(?im)^\s*Title:\s*(.*?)\s*\n\s*URL:\s*(https?://\S+)")
+    raw_url = re.compile(r"https?://[^\s\])}>\"']+")
+    sources = []
+    seen = set()
     for message in messages:
         if getattr(message, "type", None) != "tool" or getattr(message, "status", None) == "error":
             continue
         content = _message_text(message)
-        if content:
-            evidence.append(content[:500])
-    evidence_text = "\n\n".join(f"Source result {index + 1}: {item}" for index, item in enumerate(evidence[-4:]))
+        if not content or content.lower().startswith(("web search is unavailable", "error fetching", "error:")):
+            continue
+        labeled = [(url.rstrip(".,;:"), title.strip()) for title, url in markdown_link.findall(content)]
+        labeled.extend((url.rstrip(".,;:"), title.strip()) for title, url in title_and_url.findall(content))
+        labeled_urls = {url for url, _ in labeled}
+        for url in raw_url.findall(content):
+            url = url.rstrip(".,;:")
+            if url not in labeled_urls:
+                start = content.find(url)
+                previous = content[max(0, content.rfind("\n", 0, start)):start]
+                label_match = re.search(r"(?:PDF Link|URL|Source):\s*$", previous, re.IGNORECASE)
+                labeled.append((url, "Paper PDF" if label_match and "PDF" in label_match.group(0).upper() else "Retrieved source"))
+        for url, title in labeled:
+            if url not in seen:
+                sources.append((title or "Retrieved source", url))
+                seen.add(url)
+                if len(sources) >= limit:
+                    return sources
+    return sources
+
+
+def _append_tool_sources(answer: str, messages: list) -> str:
+    sources = [(title, url) for title, url in _tool_source_links(messages) if url not in (answer or "")]
+    if not sources:
+        return answer
+    links = "\n".join(f"- [{title}]({url})" for title, url in sources)
+    return f"{answer.rstrip()}\n\n**Sources**\n{links}"
+
+
+def _bounded_final_answer(question: str, messages: list, partial_answer: str, reason: str) -> tuple[str, bool] | None:
+    """Make one concise no-tools final-answer attempt from collected evidence."""
+    evidence = []
+    for message in _relevant_tool_messages(question, messages, limit=3):
+        content = _message_text(message)
+        evidence.append(content[:500])
+    evidence_text = "\n\n".join(f"Retrieved evidence {index + 1}: {item}" for index, item in enumerate(evidence))
     prompt = (
-        "Finish the user's answer in at most 160 words using only the evidence below. Do not call tools. "
-        "For a comparison, output one brief introduction, a compact table with no more than three rows, "
-        "and one practical recommendation. Do not repeat the partial text verbatim if it is cut off.\n\n"
-        f"Question: {question[:500]}\n\n"
-        f"Source results collected:\n{evidence_text or 'No successful tool results were collected.'}\n\n"
-        f"Partial answer (may end abruptly):\n{(partial_answer or '')[:900]}"
+        "Write a concise final response in about 200 to 250 words using only the retrieved evidence and draft below. "
+        "Do not call tools or repeat the research workflow. Use a short introduction, a few focused points, and a brief conclusion. "
+        "Use a small table only if it clarifies a comparison. Cite only exact titles and URLs shown in the evidence; label other "
+        "statements general background, and do not invent sources.\n\n"
+        f"Question: {question[:450]}\n\n"
+        f"Relevant retrieved evidence:\n{evidence_text or 'No relevant successful tool results were collected.'}\n\n"
+        f"Partial draft, which may stop mid-sentence:\n{(partial_answer or '')[:750]}"
     )[:CHAT_FINAL_ATTEMPT_MAX_CHARS]
     started = time.perf_counter()
     logger.info("agent_request_stage stage=bounded_final_attempt reason=%s", reason)
@@ -761,6 +826,8 @@ def run_agent(question: str, thread_id: str) -> dict:
                 response_reason = "output_limit"
         else:
             final_answer = _mark_incomplete_answer(str(final_answer), response_reason)
+
+    final_answer = _append_tool_sources(final_answer, current_messages)
 
     # ── Extract reasoning steps (tool calls) ───────────────────────────────
     # Walk through all messages to find tool calls and their results.
