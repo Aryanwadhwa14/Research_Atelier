@@ -1,6 +1,7 @@
 """Offline behavior tests for literature-review ranking and synthesis safeguards."""
 
 import unittest
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -125,6 +126,66 @@ class PaperRankingTests(unittest.TestCase):
 
 
 class LiteratureReviewTests(unittest.TestCase):
+    def test_arxiv_and_github_retrieval_are_started_concurrently(self):
+        both_started = threading.Barrier(2)
+        paper = {
+            "title": "Retrieval for language models",
+            "abstract": "This abstract evaluates retrieval augmented generation.",
+            "authors": [], "published": None, "categories": [],
+            "url": "https://arxiv.org/abs/concurrent", "pdf_url": None,
+        }
+        draft = (
+            "## Cross-paper interpretation\n\nThe abstract evaluates retrieval [P1].\n\n"
+            "## Candidate research gaps\n\nA broader sample could be examined."
+        )
+        def arxiv_lookup(topic):
+            both_started.wait(timeout=2)
+            return [paper], None
+        def github_lookup(topic):
+            both_started.wait(timeout=2)
+            return [], None
+
+        model = MagicMock()
+        model.invoke.return_value = SimpleNamespace(content=draft)
+        with (
+            patch("agent._retrieve_arxiv_records", side_effect=arxiv_lookup),
+            patch("agent._retrieve_github_repositories", side_effect=github_lookup),
+            patch("agent.llm", model),
+        ):
+            result = agent.generate_literature_review("retrieval for language models")
+
+        self.assertEqual(len(result["papers"]), 1)
+        self.assertEqual(result["repositories"], [])
+
+    def test_partial_arxiv_results_survive_a_later_query_failure(self):
+        topic = "RAG versus fine-tuning for large language models"
+        direct = arxiv_record(
+            "RAG and fine-tuning for large language models: an empirical comparison",
+            "We evaluate retrieval augmented generation and fine-tuning on shared tasks.",
+            "https://arxiv.org/abs/partial",
+        )
+        client = MagicMock()
+        client.results.side_effect = [iter([direct]), RuntimeError("simulated arXiv outage"), iter([])]
+        github_response = MagicMock(status_code=200)
+        github_response.json.return_value = {"items": []}
+        draft = (
+            "## Cross-paper interpretation\n\nThe retrieved abstract evaluates both approaches [P1].\n\n"
+            "## Candidate research gaps\n\nA broader sample could examine further conditions."
+        )
+        model = MagicMock()
+        model.invoke.return_value = SimpleNamespace(content=draft)
+        with (
+            patch("agent.arxiv.Client", return_value=client),
+            patch("agent.requests.get", return_value=github_response),
+            patch("agent.llm", model),
+        ):
+            result = agent.generate_literature_review(topic)
+
+        self.assertEqual(len(result["papers"]), 1)
+        self.assertEqual(result["papers"][0]["url"], direct.entry_id)
+        self.assertIn("arXiv query 2 failed", result["errors"]["arxiv"])
+        self.assertIn("Model-generated interpretation", result["review"])
+
     def test_no_joint_method_papers_returns_limitation_without_calling_model(self):
         topic = "RAG versus fine-tuning for large language models"
         unrelated_to_comparison = arxiv_record(
@@ -323,12 +384,75 @@ class LiteratureReviewTests(unittest.TestCase):
         result, model_call = run_with_mocks([record], model_exception=RuntimeError("model unavailable"))
 
         self.assertTrue(model_call.called)
-        self.assertIn("model unavailable", result["errors"]["synthesis"])
+        self.assertIn("RuntimeError", result["errors"]["synthesis"])
+        self.assertNotIn("model unavailable", result["errors"]["synthesis"])
         self.assertEqual(result["papers"][0]["title"], "Evidence retrieval for language models")
         self.assertEqual(result["papers"][0]["abstract"], abstract)
         self.assertIn(abstract, result["review"])
         self.assertIn("No cross-paper comparison or interpretation is asserted", result["review"])
         self.assertNotIn("Model-generated interpretation", result["review"])
+
+    def test_five_large_abstracts_produce_a_bounded_synthesis_request(self):
+        records = [
+            arxiv_record(
+                f"Retrieval paper {index}",
+                ("This study evaluates retrieval augmented generation for large language models. " * 5000),
+                f"https://arxiv.org/abs/{index}",
+            )
+            for index in range(5)
+        ]
+        valid = (
+            "## Cross-paper interpretation\n\nThe excerpts concern retrieval [P1].\n\n"
+            "## Candidate research gaps\n\nA broader review could examine this question."
+        )
+        result, model_call = run_with_mocks(records, model_text=valid)
+
+        prompt = model_call.call_args.args[0]
+        self.assertEqual(len(result["papers"]), 5)
+        self.assertLessEqual(len(prompt), agent.SYNTHESIS_MAX_INPUT_CHARS)
+        self.assertLessEqual(
+            agent._estimate_request_tokens(prompt, agent.SYNTHESIS_MAX_OUTPUT_TOKENS),
+            agent.SYNTHESIS_MAX_ESTIMATED_REQUEST_TOKENS,
+        )
+        self.assertLessEqual(model_call.call_args.kwargs["max_tokens"], agent.SYNTHESIS_MAX_OUTPUT_TOKENS)
+        self.assertNotIn("Authors:", prompt)
+        self.assertNotIn("URL:", prompt)
+        self.assertLess(len(result["review"]), 12000)
+        self.assertLessEqual(len(result["papers"][0]["abstract"]), agent.RETRIEVED_ABSTRACT_MAX_CHARS + 32)
+        self.assertIn("[abstract shortened]", result["papers"][0]["abstract"])
+
+    def test_context_limit_error_returns_readable_evidence_fallback(self):
+        abstract = "This paper evaluates retrieval for evidence-grounded question answering."
+        records = [
+            arxiv_record(f"Retrieval study {i}", abstract, f"https://arxiv.org/abs/{i}")
+            for i in range(5)
+        ]
+        failure = RuntimeError(
+            "Request too large for model openai/gpt-oss-20b on tokens per minute (TPM): "
+            "Limit 8000, Requested 58283"
+        )
+        result, model_call = run_with_mocks(records, model_exception=failure)
+
+        self.assertEqual(model_call.call_count, 1)
+        self.assertIn("per-request token budget", result["errors"]["synthesis"])
+        self.assertNotIn("58283", result["errors"]["synthesis"])
+        self.assertIn("## Evidence reported in retrieved abstracts", result["review"])
+        self.assertIn("Retrieval study 0", result["review"])
+        self.assertIn(abstract, result["review"])
+        self.assertIn("No cross-paper comparison or interpretation is asserted", result["review"])
+        self.assertNotIn("Model-generated interpretation", result["review"])
+
+    def test_model_rate_limit_is_reported_and_keeps_evidence_fallback(self):
+        record = arxiv_record(
+            "Retrieval study", "The abstract evaluates retrieval for question answering.",
+            "https://arxiv.org/abs/rate-limit",
+        )
+        result, _ = run_with_mocks([record], model_exception=RuntimeError("Rate limit reached (429)"))
+
+        self.assertIn("rate limit", result["errors"]["synthesis"])
+        self.assertIn("Please retry later", result["errors"]["synthesis"])
+        self.assertIn("## Incomplete review: synthesis unavailable", result["review"])
+        self.assertIn("The abstract evaluates retrieval", result["review"])
 
     def test_absolute_claim_with_valid_citation_uses_fallback(self):
         record = arxiv_record("RAG for language models", "An approach is described.", "https://arxiv.org/abs/1")
@@ -428,6 +552,16 @@ class LiteratureReviewTests(unittest.TestCase):
 
 
 class ApiCompatibilityTests(unittest.TestCase):
+    def test_chat_endpoint_hides_internal_agent_exception_details(self):
+        client = TestClient(main.app)
+        with patch("main.run_agent", side_effect=RuntimeError("INVALID_CHAT_HISTORY secret payload")):
+            response = client.post("/ask", json={"question": "Explain vector database trade-offs"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Please retry", response.json()["detail"])
+        self.assertNotIn("INVALID_CHAT_HISTORY", response.text)
+        self.assertNotIn("secret payload", response.text)
+
     def test_review_route_returns_composed_review_without_caching_and_ask_is_preserved(self):
         topic = "RAG versus fine-tuning for large language models"
         composed_review = "## Cross-paper interpretation\n\nCurrent review [P1]."

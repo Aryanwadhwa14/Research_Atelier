@@ -12,14 +12,20 @@ import os
 import re
 import json
 import logging
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import arxiv
 import requests
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_community.tools import DuckDuckGoSearchResults
+from ddgs import DDGS
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import RemoveMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 # Load environment variables from .env file (picks up GROQ_API_KEY)
 load_dotenv()
@@ -33,20 +39,129 @@ llm = ChatGroq(
     model="openai/gpt-oss-20b",
     temperature=0.2,
     api_key=os.getenv("GROQ_API_KEY"),
+    timeout=30,
+    max_retries=1,
+    max_tokens=900,
 )
 
+
+class _ModelTimingCallback(BaseCallbackHandler):
+    """Log model latency and token counts without logging prompt/response text."""
+
+    def __init__(self):
+        self._started = {}
+        self._lock = threading.Lock()
+
+    def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
+        with self._lock:
+            self._started[run_id] = time.perf_counter()
+
+    def on_llm_start(self, serialized, prompts, *, run_id, **kwargs):
+        with self._lock:
+            self._started[run_id] = time.perf_counter()
+
+    def on_llm_end(self, response, *, run_id, **kwargs):
+        with self._lock:
+            started = self._started.pop(run_id, None)
+        usage = (getattr(response, "llm_output", None) or {}).get("token_usage") or {}
+        input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
+        output_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
+        if input_tokens is None or output_tokens is None:
+            for batch in getattr(response, "generations", []) or []:
+                for generation in batch:
+                    metadata = getattr(getattr(generation, "message", None), "usage_metadata", None) or {}
+                    input_tokens = input_tokens if input_tokens is not None else metadata.get("input_tokens")
+                    output_tokens = output_tokens if output_tokens is not None else metadata.get("output_tokens")
+        duration_ms = round((time.perf_counter() - started) * 1000, 1) if started else None
+        logger.info(
+            "groq_call_complete model=%s duration_ms=%s input_tokens=%s output_tokens=%s",
+            GROQ_MODEL,
+            duration_ms,
+            input_tokens,
+            output_tokens,
+        )
+
+    def on_llm_error(self, error, *, run_id, **kwargs):
+        with self._lock:
+            started = self._started.pop(run_id, None)
+        duration_ms = round((time.perf_counter() - started) * 1000, 1) if started else None
+        logger.warning(
+            "groq_call_failed model=%s duration_ms=%s error_type=%s",
+            GROQ_MODEL,
+            duration_ms,
+            type(error).__name__,
+        )
+
+
+GROQ_MODEL = "openai/gpt-oss-20b"
+
 # ── Tool Setup ─────────────────────────────────────────────────────────────────
-# DuckDuckGoSearchResults returns search snippets from the web.
-# No API key needed — it scrapes DuckDuckGo directly.
-search_tool = DuckDuckGoSearchResults(
-    name="web_search",
-    max_results=3,
-    description=(
-        "Search the web using DuckDuckGo. Use this tool when you need to find "
-        "current information, facts, or data that you don't already know. "
-        "Input should be a search query string."
-    ),
-)
+WEB_SEARCH_TIMEOUT_SECONDS = 5
+WEB_SEARCH_ATTEMPTS = 2
+WEB_SEARCH_BACKENDS = "duckduckgo,yahoo"
+TOOL_RESULT_MAX_CHARS = 2000
+RETRIEVED_ABSTRACT_MAX_CHARS = 5000
+
+
+def _limit_tool_result(text: str) -> str:
+    text = str(text)
+    if len(text) <= TOOL_RESULT_MAX_CHARS:
+        return text
+    return text[:TOOL_RESULT_MAX_CHARS].rstrip() + " … [tool result shortened]"
+
+
+@tool
+def web_search(query: str) -> str:
+    """Search current web pages for useful facts and return their titles, URLs, and snippets.
+    Use this for current or specific information. If unavailable, use arxiv_tool or
+    github_repo_info when relevant and clearly disclose that web search failed."""
+    for attempt in range(1, WEB_SEARCH_ATTEMPTS + 1):
+        started = time.perf_counter()
+        try:
+            with DDGS(timeout=WEB_SEARCH_TIMEOUT_SECONDS) as search:
+                results = search.text(
+                    query,
+                    max_results=3,
+                    backend=WEB_SEARCH_BACKENDS,
+                )
+            if not results:
+                logger.info(
+                    "external_search_complete provider=ddgs duration_ms=%.1f result_count=0 attempt=%s",
+                    (time.perf_counter() - started) * 1000,
+                    attempt,
+                )
+                return "Web search completed but returned no results for this query."
+
+            formatted = "\n\n".join(
+                f"Title: {item.get('title') or 'Untitled result'}\n"
+                f"URL: {item.get('href') or 'Not provided'}\n"
+                f"Snippet: {item.get('body') or 'No snippet provided.'}"
+                for item in results
+            )
+            logger.info(
+                "external_search_complete provider=ddgs duration_ms=%.1f result_count=%s attempt=%s",
+                (time.perf_counter() - started) * 1000,
+                len(results),
+                attempt,
+            )
+            return _limit_tool_result(formatted)
+        except Exception as exc:
+            logger.warning(
+                "web_search_failed provider=ddgs provider_set=%s attempt=%s/%s duration_ms=%.1f error_type=%s",
+                WEB_SEARCH_BACKENDS,
+                attempt,
+                WEB_SEARCH_ATTEMPTS,
+                (time.perf_counter() - started) * 1000,
+                type(exc).__name__,
+            )
+            if attempt < WEB_SEARCH_ATTEMPTS:
+                time.sleep(0.25 * attempt)
+            else:
+                return (
+                    "Web search is unavailable after two attempts "
+                    f"({type(exc).__name__}). No web results were retrieved. "
+                    "Continue with other relevant research tools, and do not present this as a successful search."
+                )
 
 
 @tool
@@ -54,14 +169,20 @@ def arxiv_tool(query: str) -> str:
     """Search arXiv for scientific papers, academic preprints, and research publications across physics, computer science, mathematics, quantitative biology, quantitative finance, statistics, electrical engineering, and economics.
     Use this tool when you need to find academic papers, scientific articles, or research publications.
     Input should be a search query string (e.g. 'retrieval augmented generation' or 'LLM reasoning agents')."""
+    started = time.perf_counter()
     try:
-        client = arxiv.Client()
+        client = arxiv.Client(delay_seconds=3.0, num_retries=1)
         search = arxiv.Search(
             query=query,
             max_results=3,
             sort_by=arxiv.SortCriterion.Relevance,
         )
         results = list(client.results(search))
+        logger.info(
+            "external_search_complete provider=arxiv_tool duration_ms=%.1f result_count=%s",
+            (time.perf_counter() - started) * 1000,
+            len(results),
+        )
         if not results:
             return f"No arXiv papers found for query: '{query}'."
 
@@ -83,9 +204,14 @@ def arxiv_tool(query: str) -> str:
                 f"- **Summary:** {summary}"
             )
 
-        return "\n\n".join(formatted_papers)
+        return _limit_tool_result("\n\n".join(formatted_papers))
     except Exception as e:
-        return f"Error fetching arXiv papers: {str(e)}"
+        logger.warning(
+            "external_search_failed provider=arxiv_tool duration_ms=%.1f error_type=%s",
+            (time.perf_counter() - started) * 1000,
+            type(e).__name__,
+        )
+        return _limit_tool_result(f"Error fetching arXiv papers: {type(e).__name__}")
 
 
 @tool
@@ -104,6 +230,7 @@ def github_repo_info(repo: str) -> str:
     owner, repo_name = parts[0], parts[1]
     url = f"https://api.github.com/repos/{owner}/{repo_name}"
 
+    started = time.perf_counter()
     try:
         response = requests.get(
             url,
@@ -114,9 +241,18 @@ def github_repo_info(repo: str) -> str:
             timeout=10,
         )
         if response.status_code == 404:
+            logger.info(
+                "external_search_complete provider=github_repo duration_ms=%.1f result_count=0 status=404",
+                (time.perf_counter() - started) * 1000,
+            )
             return f"Repository '{owner}/{repo_name}' was not found on GitHub."
         elif response.status_code != 200:
-            return f"GitHub API returned status {response.status_code}: {response.text}"
+            logger.warning(
+                "external_search_failed provider=github_repo duration_ms=%.1f status=%s",
+                (time.perf_counter() - started) * 1000,
+                response.status_code,
+            )
+            return _limit_tool_result(f"GitHub API returned status {response.status_code}.")
 
         data = response.json()
         name = data.get("full_name", f"{owner}/{repo_name}")
@@ -126,10 +262,14 @@ def github_repo_info(repo: str) -> str:
         open_issues = data.get("open_issues_count", 0)
         language = data.get("language") or "Not specified"
         html_url = data.get("html_url", f"https://github.com/{owner}/{repo_name}")
+        logger.info(
+            "external_search_complete provider=github_repo duration_ms=%.1f result_count=1",
+            (time.perf_counter() - started) * 1000,
+        )
         license_info = data.get("license")
         license_name = license_info.get("name") if license_info else "No license"
 
-        return (
+        return _limit_tool_result(
             f"**GitHub Repository:** [{name}]({html_url})\n"
             f"- **URL:** {html_url}\n"
             f"- **Description:** {description}\n"
@@ -140,11 +280,16 @@ def github_repo_info(repo: str) -> str:
             f"- **License:** {license_name}"
         )
     except Exception as e:
-        return f"Error fetching GitHub repo info: {str(e)}"
+        logger.warning(
+            "external_search_failed provider=github_repo duration_ms=%.1f error_type=%s",
+            (time.perf_counter() - started) * 1000,
+            type(e).__name__,
+        )
+        return _limit_tool_result(f"Error fetching GitHub repo info: {type(e).__name__}")
 
 
 # List of tools the agent can use
-tools = [search_tool, github_repo_info, arxiv_tool]
+tools = [web_search, github_repo_info, arxiv_tool]
 
 # System prompt to ensure clean, structured answers
 SYSTEM_PROMPT = (
@@ -153,6 +298,8 @@ SYSTEM_PROMPT = (
     "use the arxiv_tool when searching for academic papers, scientific articles, or research publications, "
     "or use the github_repo_info tool when asked about GitHub repositories. "
     "Always provide a well-structured, clear, and comprehensive final response directly addressing the user. "
+    "If a tool reports an error or no results, do not describe that tool as successful or invent results. "
+    "Continue with other relevant tools when possible and disclose unavailable sources. "
     "Do not output raw internal thinking or scratchpad notes in your final answer."
 )
 
@@ -160,12 +307,181 @@ SYSTEM_PROMPT = (
 # create_react_agent builds a ReAct agent as a LangGraph StateGraph.
 # MemorySaver enables persistent conversation history per thread_id (session).
 checkpointer = MemorySaver()
+CHAT_HISTORY_MAX_CHARS = 6500
+CHAT_HISTORY_MAX_TURNS = 6
+CHAT_TOOL_RESULT_MAX_CHARS = 600
+
+
+def _message_size(message) -> int:
+    content = getattr(message, "content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False, default=str)
+    extra = getattr(message, "additional_kwargs", {}) or {}
+    reasoning = extra.get("reasoning_content", "")
+    calls = json.dumps(getattr(message, "tool_calls", []) or [], ensure_ascii=False, default=str)
+    return len(content) + len(str(reasoning)) + len(calls)
+
+
+def _bound_chat_history(messages: list) -> tuple[list, bool]:
+    """Keep recent complete turns within a conservative character budget."""
+    turns = []
+    for message in messages:
+        if getattr(message, "type", None) == "human" and turns:
+            turns.append([])
+        if not turns:
+            turns.append([])
+        turns[-1].append(message)
+
+    changed = False
+    while len(turns) > CHAT_HISTORY_MAX_TURNS or (
+        len(turns) > 1 and sum(_message_size(message) for turn in turns for message in turn) > CHAT_HISTORY_MAX_CHARS
+    ):
+        turns.pop(0)
+        changed = True
+    bounded = [message for turn in turns for message in turn]
+
+    if sum(_message_size(message) for message in bounded) > CHAT_HISTORY_MAX_CHARS:
+        for index in range(len(bounded) - 1, -1, -1):
+            message = bounded[index]
+            if getattr(message, "type", None) != "tool":
+                continue
+            content = getattr(message, "content", "")
+            if isinstance(content, str) and len(content) > CHAT_TOOL_RESULT_MAX_CHARS:
+                bounded[index] = message.model_copy(update={
+                    "content": content[:CHAT_TOOL_RESULT_MAX_CHARS].rstrip() + " … [tool result shortened]"
+                })
+                changed = True
+            if sum(_message_size(item) for item in bounded) <= CHAT_HISTORY_MAX_CHARS:
+                break
+    return bounded, changed
+
+
+def _close_incomplete_tool_calls(state: dict) -> dict:
+    """Persist an error ToolMessage for every unfinished call before the LLM runs.
+
+    LangGraph can resume a checkpoint at its model node after a tool batch was
+    only partly written. This hook runs inside the ReAct loop, including after
+    each tool batch, and keeps the conversation while closing only missing IDs.
+    """
+    messages = list(state.get("messages", []))
+    completed_ids = set()
+    unique_messages = []
+    duplicate_tool_message = False
+    for message in messages:
+        call_id = getattr(message, "tool_call_id", None)
+        if getattr(message, "type", None) == "tool" and call_id:
+            if call_id in completed_ids:
+                duplicate_tool_message = True
+                continue
+            completed_ids.add(call_id)
+        unique_messages.append(message)
+    messages = unique_messages
+    pending = []
+    for message in messages:
+        if getattr(message, "type", None) != "ai":
+            continue
+        for call in getattr(message, "tool_calls", []) or []:
+            call_id = call.get("id")
+            if call_id and call_id not in completed_ids:
+                pending.append((call_id, call.get("name") or "tool"))
+
+    repaired = messages + [
+        ToolMessage(
+            content=(
+                f"Tool '{name}' did not finish in the previous execution. "
+                "No result is available; retry it only if needed."
+            ),
+            tool_call_id=call_id,
+            name=name,
+            status="error",
+        )
+        for call_id, name in pending
+    ]
+    bounded, history_trimmed = _bound_chat_history(repaired)
+
+    if not pending and not duplicate_tool_message and not history_trimmed:
+        # Input only is sufficient; leave the checkpoint untouched.
+        return {"llm_input_messages": bounded}
+    logger.warning(
+        "normalized_agent_history missing_results=%s duplicate_results_removed=%s history_trimmed=%s retained_chars=%s",
+        len(pending),
+        duplicate_tool_message,
+        history_trimmed,
+        sum(_message_size(message) for message in bounded),
+    )
+    # Overwrite the reducer-backed history and give the exact same repaired
+    # sequence to the model. The old user/assistant messages remain intact.
+    return {
+        "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *bounded],
+        "llm_input_messages": bounded,
+    }
+
+
+# Striped locks bound memory while serializing requests that share a thread ID.
+_THREAD_LOCKS = [threading.RLock() for _ in range(64)]
+
+
+def _thread_lock(thread_id: str):
+    return _THREAD_LOCKS[hash(thread_id) % len(_THREAD_LOCKS)]
+
+
 agent = create_react_agent(
     model=llm,
     tools=tools,
     prompt=SYSTEM_PROMPT,
     checkpointer=checkpointer,
+    pre_model_hook=_close_incomplete_tool_calls,
 )
+
+
+def _repair_incomplete_tool_history(graph, config: dict) -> int:
+    """Close interrupted tool-call batches in a checkpoint before model reuse.
+
+    A process interruption can checkpoint an AIMessage containing tool calls
+    before the ToolNode has saved its ToolMessages. Add explicit error results
+    for only those unanswered calls so later turns keep the rest of the thread.
+    """
+    snapshot = graph.get_state(config)
+    messages = (getattr(snapshot, "values", None) or {}).get("messages", [])
+    completed_ids = {
+        message.tool_call_id
+        for message in messages
+        if getattr(message, "type", None) == "tool" and getattr(message, "tool_call_id", None)
+    }
+    pending = []
+    for message in messages:
+        if getattr(message, "type", None) != "ai":
+            continue
+        for call in getattr(message, "tool_calls", []) or []:
+            call_id = call.get("id")
+            if call_id and call_id not in completed_ids:
+                pending.append((call_id, call.get("name", "tool")))
+
+    if not pending:
+        return 0
+
+    graph.update_state(
+        config,
+        {
+            "messages": [
+                ToolMessage(
+                    content=(
+                        f"Tool '{name}' did not finish in the previous request. "
+                        "No result is available; retry it only if needed."
+                    ),
+                    tool_call_id=call_id,
+                    name=name,
+                    status="error",
+                )
+                for call_id, name in pending
+            ]
+        },
+        # Mark the recovery messages as tool results so the graph routes back
+        # to the model, instead of trying to execute the stale calls again.
+        as_node="tools",
+    )
+    logger.warning("repaired_incomplete_tool_history count=%s", len(pending))
+    return len(pending)
 
 
 def run_agent(question: str, thread_id: str) -> dict:
@@ -186,11 +502,28 @@ def run_agent(question: str, thread_id: str) -> dict:
     """
     # Invoke the agent with the user's question as a HumanMessage
     # Pass config with thread_id so the agent retains conversation history in this session
-    config = {"configurable": {"thread_id": thread_id}}
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": question}]},
-        config=config,
-    )
+    request_started = time.perf_counter()
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": [_ModelTimingCallback()],
+        "recursion_limit": 12,
+    }
+    # MemorySaver is process-local; prevent overlapping requests from racing a
+    # shared checkpoint within this worker. Different sessions can still run.
+    with _thread_lock(thread_id):
+        _repair_incomplete_tool_history(agent, config)
+        try:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": question}]},
+                config=config,
+            )
+        except Exception:
+            # The pre-model hook repairs persisted partial batches on every
+            # model step. This boundary repair handles failures that escape
+            # before LangGraph gets another chance to run that hook.
+            if not _repair_incomplete_tool_history(agent, config):
+                raise
+            result = agent.invoke({"messages": []}, config=config)
 
     # ── Extract the final answer ───────────────────────────────────────────
     # The last message in the conversation is the agent's final response
@@ -221,6 +554,13 @@ def run_agent(question: str, thread_id: str) -> dict:
                 }
                 steps.append(step)
 
+    logger.info(
+        "agent_request_complete duration_ms=%.1f message_count=%s tool_call_count=%s",
+        (time.perf_counter() - request_started) * 1000,
+        len(messages),
+        len(steps),
+    )
+
     return {
         "answer": final_answer,
         "steps": steps,
@@ -239,6 +579,70 @@ def _topic_terms(text: str) -> set[str]:
         term for term in re.findall(r"[a-z0-9]+", (text or "").lower())
         if term not in _RANK_STOPWORDS
     }
+
+
+SYNTHESIS_ABSTRACT_CHARS = 650
+SYNTHESIS_TITLE_CHARS = 200
+SYNTHESIS_TOPIC_CHARS = 300
+SYNTHESIS_MAX_INPUT_CHARS = 7000
+SYNTHESIS_MAX_OUTPUT_TOKENS = 900
+SYNTHESIS_MAX_ESTIMATED_REQUEST_TOKENS = 6000
+
+
+def _estimate_request_tokens(prompt: str, completion_ceiling: int) -> int:
+    """Conservative rough estimate for English text; never treated as tokenizer output."""
+    return (len(prompt) + 1) // 2 + completion_ceiling
+
+
+def _bound_synthesis_prompt(prompt: str) -> str:
+    input_char_budget = min(
+        SYNTHESIS_MAX_INPUT_CHARS,
+        max(0, 2 * (SYNTHESIS_MAX_ESTIMATED_REQUEST_TOKENS - SYNTHESIS_MAX_OUTPUT_TOKENS)),
+    )
+    return prompt[:input_char_budget]
+
+
+def _bounded_abstract_excerpt(abstract: str, topic: str, limit: int = SYNTHESIS_ABSTRACT_CHARS) -> str:
+    """Select a topic-relevant, character-bounded excerpt from an abstract."""
+    text = " ".join((abstract or "").split())
+    if len(text) <= limit:
+        return text
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    terms = _topic_terms(topic)
+    scored = sorted(
+        enumerate(sentences),
+        key=lambda item: (-len(terms.intersection(_topic_terms(item[1]))), item[0]),
+    )
+    selected = []
+    used = 0
+    for _, sentence in scored:
+        extra = len(sentence) + (1 if selected else 0)
+        if used + extra <= limit:
+            selected.append(sentence)
+            used += extra
+    if not selected:
+        selected = [text[:limit].rsplit(" ", 1)[0]]
+    # Restore the paper's original sentence order after relevance selection.
+    selected.sort(key=lambda sentence: sentences.index(sentence))
+    excerpt = " ".join(selected)
+    if len(excerpt) > limit:
+        excerpt = excerpt[:limit].rsplit(" ", 1)[0]
+    return excerpt.rstrip(" .") + " … [excerpt limited]"
+
+
+def _friendly_synthesis_error(exc: Exception, *, attempt: int) -> str:
+    """Return a concise user-facing error without exposing raw request details."""
+    description = str(exc).lower()
+    phase = "retry" if attempt > 1 else "generation"
+    if any(marker in description for marker in ("rate limit", "too many requests", "429")):
+        return f"Model rate limit reached during synthesis {phase}; retrieved evidence is shown below. Please retry later."
+    if "tokens per minute" in description or re.search(r"\btpm\b", description):
+        return f"Groq's per-request token budget prevented synthesis during {phase}; retrieved evidence is shown below."
+    if any(marker in description for marker in (
+        "request too large", "context length", "context window", "token limit", "maximum context"
+    )) or re.search(r"requested\s+\d+.{0,40}limit\s+\d+", description):
+        return f"Model input limit prevented synthesis during {phase}; retrieved evidence is shown below."
+    return f"Model synthesis failed during {phase} ({type(exc).__name__}); retrieved evidence is shown below."
 
 
 def _is_rag_finetuning_comparison(topic: str) -> bool:
@@ -443,7 +847,7 @@ def _compose_review(topic: str, papers: list[dict], interpretation: str) -> str:
             f"- **Authors:** {', '.join(paper.get('authors') or []) or 'Not listed'}\n"
             f"- **Published:** {paper.get('published') or 'Not listed'}\n"
             f"- **arXiv categories:** {', '.join(paper.get('categories') or []) or 'Not listed'}\n\n"
-            f"{paper.get('abstract') or 'No abstract was provided in the retrieved record.'}\n\n"
+            f"{_bounded_abstract_excerpt(paper.get('abstract') or '', topic) or 'No abstract was provided in the retrieved record.'}\n\n"
             f"Source: {paper.get('url') or 'URL not provided'}"
         )
     lines.append("## Model-generated interpretation (based on the abstracts only)\n\n" + interpretation.strip())
@@ -453,6 +857,7 @@ def _compose_review(topic: str, papers: list[dict], interpretation: str) -> str:
 def _fallback_review(topic: str, papers: list[dict]) -> str:
     """Return retrieved evidence and explicit limits without synthesizing conclusions."""
     lines = [
+        "## Incomplete review: synthesis unavailable",
         f"## Topic and search scope\n\nThis response covers {len(papers)} arXiv record(s) retrieved for **{topic}**. "
         "It is a small, search-dependent sample and is not a comprehensive literature review.",
         "## Evidence reported in retrieved abstracts",
@@ -460,7 +865,8 @@ def _fallback_review(topic: str, papers: list[dict]) -> str:
     for paper in papers:
         authors = ", ".join(paper.get("authors") or []) or "Authors not listed"
         date = paper.get("published") or "Publication date not listed"
-        abstract = paper.get("abstract") or "No abstract was provided in the retrieved record."
+        abstract = _bounded_abstract_excerpt(paper.get("abstract") or "", topic)
+        abstract = abstract or "No abstract was provided in the retrieved record."
         lines.append(
             f"### [{paper['citation_id']}] {paper.get('title') or 'Title not provided'}\n\n"
             f"{abstract}\n\nSource: {paper.get('url') or 'URL not provided'} · {authors} · {date}"
@@ -478,27 +884,35 @@ def _fallback_review(topic: str, papers: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def generate_literature_review(topic: str) -> dict:
-    """Retrieve real arXiv papers and GitHub records, then synthesize a sourced review."""
+def _retrieve_arxiv_records(topic: str) -> tuple[list[dict], str | None]:
+    """Run the small arXiv query set with bounded retries and per-query timing."""
     paper_by_key = {}
     search_errors = []
-    comparison_topic = _is_rag_finetuning_comparison(topic)
+    queries = build_arxiv_queries(topic)
+    retrieval_started = time.perf_counter()
     try:
-        client = arxiv.Client()
+        # arXiv asks clients to leave a delay between requests; keep those
+        # requests sequential and bound library retries instead of spiking it.
+        client = arxiv.Client(delay_seconds=3.0, num_retries=1)
     except Exception as exc:
         client = None
-        search_errors.append(str(exc))
+        search_errors.append(f"arXiv client unavailable ({type(exc).__name__}).")
     if client:
-        for query in build_arxiv_queries(topic):
+        for query_index, query in enumerate(queries, start=1):
+            query_started = time.perf_counter()
+            result_count = 0
             try:
                 search = arxiv.Search(
                     query=query,
-                    max_results=12 if comparison_topic else 20,
+                    max_results=12,
                     sort_by=arxiv.SortCriterion.Relevance,
                 )
                 for result in client.results(search):
+                    result_count += 1
                     title = " ".join((getattr(result, "title", None) or "").split())
                     abstract = " ".join((getattr(result, "summary", None) or "").split())
+                    if len(abstract) > RETRIEVED_ABSTRACT_MAX_CHARS:
+                        abstract = abstract[:RETRIEVED_ABSTRACT_MAX_CHARS].rsplit(" ", 1)[0] + " … [abstract shortened]"
                     # A record with neither a title nor abstract cannot provide useful evidence.
                     if not title and not abstract:
                         continue
@@ -515,48 +929,97 @@ def generate_literature_review(topic: str) -> dict:
                     key = paper["url"] or f"{paper['title'].casefold()}|{abstract.casefold()}"
                     paper_by_key.setdefault(key, paper)
             except Exception as exc:
-                search_errors.append(f"{query}: {exc}")
+                search_errors.append(f"arXiv query {query_index} failed ({type(exc).__name__}).")
+                logger.warning(
+                    "external_search_failed provider=arxiv query_index=%s duration_ms=%.1f error_type=%s",
+                    query_index,
+                    (time.perf_counter() - query_started) * 1000,
+                    type(exc).__name__,
+                )
+            else:
+                logger.info(
+                    "external_search_complete provider=arxiv query_index=%s duration_ms=%.1f result_count=%s",
+                    query_index,
+                    (time.perf_counter() - query_started) * 1000,
+                    result_count,
+                )
 
-    papers = list(paper_by_key.values())
-    paper_error = "; ".join(search_errors) or None
+    logger.info(
+        "external_retrieval_complete provider=arxiv duration_ms=%.1f unique_count=%s query_count=%s",
+        (time.perf_counter() - retrieval_started) * 1000,
+        len(paper_by_key),
+        len(queries),
+    )
+    return list(paper_by_key.values()), "; ".join(search_errors) or None
 
-    # Rank any records retrieved before a transient iteration failure too.
-    papers = rank_papers(topic, papers, limit=5)
-    for index, paper in enumerate(papers, start=1):
-        paper["citation_id"] = f"P{index}"
 
+def _retrieve_github_repositories(topic: str) -> tuple[list[dict], str | None]:
+    """Retrieve related repositories with a bounded request and safe timing logs."""
+    started = time.perf_counter()
     repositories = []
-    github_error = None
+    error = None
     try:
         response = requests.get(
             "https://api.github.com/search/repositories",
             params={"q": topic, "sort": "stars", "order": "desc", "per_page": 5},
             headers={"Accept": "application/vnd.github+json", "User-Agent": "Agentic-Research-Assistant"},
-            timeout=12,
+            timeout=8,
         )
         if response.status_code == 403 or response.status_code == 429:
-            github_error = "GitHub search rate limit reached."
+            error = "GitHub search rate limit reached."
         else:
             response.raise_for_status()
             for repo in response.json().get("items", []):
                 repositories.append({
                     "name": repo.get("full_name"),
-                    "description": repo.get("description"),
+                    "description": (repo.get("description") or "")[:500] or None,
                     "url": repo.get("html_url"),
                     "stars": repo.get("stargazers_count"),
                     "language": repo.get("language"),
                 })
     except Exception as exc:
-        github_error = str(exc)
+        error = f"GitHub search failed ({type(exc).__name__})."
+        logger.warning(
+            "external_search_failed provider=github duration_ms=%.1f error_type=%s",
+            (time.perf_counter() - started) * 1000,
+            type(exc).__name__,
+        )
+    logger.info(
+        "external_retrieval_complete provider=github duration_ms=%.1f result_count=%s error=%s",
+        (time.perf_counter() - started) * 1000,
+        len(repositories),
+        bool(error),
+    )
+    return repositories, error
+
+
+def generate_literature_review(topic: str) -> dict:
+    """Retrieve real arXiv papers and GitHub records concurrently, then synthesize."""
+    request_started = time.perf_counter()
+    comparison_topic = _is_rag_finetuning_comparison(topic)
+
+    # arXiv queries remain sequential to respect the API's request delay;
+    # GitHub is independent and runs at the same time.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="research-retrieval") as pool:
+        arxiv_future = pool.submit(_retrieve_arxiv_records, topic)
+        github_future = pool.submit(_retrieve_github_repositories, topic)
+        retrieved_records, paper_error = arxiv_future.result()
+        repositories, github_error = github_future.result()
+
+    # Rank any records retrieved before a transient iteration failure too.
+    papers = rank_papers(topic, retrieved_records, limit=5)
+    for index, paper in enumerate(papers, start=1):
+        paper["citation_id"] = f"P{index}"
 
     review = ""
     synthesis_error = None
     if papers:
         allowed_citation_ids = ", ".join(f"[{paper['citation_id']}]" for paper in papers)
+        # The model needs only citation ID, title, and a bounded abstract
+        # excerpt. Full metadata remains in the API response/paper cards.
         source_notes = "\n\n".join(
-            f"[{p['citation_id']}] {p['title']}\nAuthors: {', '.join(p['authors']) or 'Not listed'}\n"
-            f"Published: {p['published'] or 'Not listed'}\nCategories: {', '.join(p['categories']) or 'Not listed'}\n"
-            f"Abstract: {p['abstract'] or 'Not available'}\nURL: {p['url'] or 'Not available'}"
+            f"[{p['citation_id']}] {(p.get('title') or 'Untitled paper')[:SYNTHESIS_TITLE_CHARS]}\n"
+            f"Abstract excerpt: {_bounded_abstract_excerpt(p.get('abstract') or '', topic)}"
             for p in papers
         )
         comparison_note = _comparison_limitation(topic, papers)
@@ -574,10 +1037,14 @@ def generate_literature_review(topic: str) -> dict:
             "Do not make broad claims such as 'most research' or 'the field generally'. Research-gap statements must be "
             "candidates for further study, not established gaps. Do not claim a direct RAG-versus-fine-tuning comparison "
             "unless a supplied abstract directly compares both approaches.\n\n"
-            f"Topic: {topic}\n\n"
+            f"Topic: {topic[:SYNTHESIS_TOPIC_CHARS]}\n\n"
             f"Comparison limitation: {comparison_note or 'Relevant records may discuss the approaches without a direct comparison.'}\n\n"
             f"PAPERS:\n{source_notes}"
         )
+        # The 8,000 limit reported for this deployment is the free-tier
+        # per-request TPM budget, not the model's 131K context window. Keep
+        # prompt plus requested completion below a conservative estimate.
+        synthesis_prompt = _bound_synthesis_prompt(synthesis_prompt)
         previous_failure = None
         for attempt in range(2):
             retry_note = ""
@@ -590,13 +1057,31 @@ def generate_literature_review(topic: str) -> dict:
                     "Do not make unsupported claims; use only supplied citation IDs and claims supported by the abstracts."
                 )
             try:
-                result = llm.invoke(synthesis_prompt + retry_note)
+                prompt = _bound_synthesis_prompt(synthesis_prompt + retry_note)
+                logger.info(
+                    "groq_synthesis_prompt chars=%s estimated_request_tokens=%s completion_ceiling=%s",
+                    len(prompt),
+                    _estimate_request_tokens(prompt, SYNTHESIS_MAX_OUTPUT_TOKENS),
+                    SYNTHESIS_MAX_OUTPUT_TOKENS,
+                )
+                result = llm.invoke(
+                    prompt,
+                    max_tokens=SYNTHESIS_MAX_OUTPUT_TOKENS,
+                    config={"callbacks": [_ModelTimingCallback()]},
+                )
             except Exception as exc:
                 exception_type = type(exc).__name__
-                synthesis_error = f"Model synthesis failed during {'retry' if attempt else 'generation'}: {exc}"
+                synthesis_error = _friendly_synthesis_error(exc, attempt=attempt + 1)
+                error_lower = synthesis_error.lower()
+                stage = (
+                    "tpm_limit" if "per-request token budget" in error_lower else
+                    "rate_limit" if "rate limit" in error_lower else
+                    "input_limit" if "input limit" in error_lower else
+                    "model_invocation"
+                )
                 _log_synthesis_event(
                     logging.WARNING,
-                    stage="model_invocation",
+                    stage=stage,
                     reason=f"model call raised {exception_type}",
                     attempt=attempt + 1,
                 )
@@ -656,6 +1141,13 @@ def generate_literature_review(topic: str) -> dict:
     elif not review:
         review = _fallback_review(topic, papers)
 
+    logger.info(
+        "literature_review_complete duration_ms=%.1f paper_count=%s repository_count=%s synthesis_failed=%s",
+        (time.perf_counter() - request_started) * 1000,
+        len(papers),
+        len(repositories),
+        bool(synthesis_error),
+    )
     return {
         "topic": topic,
         "papers": papers,

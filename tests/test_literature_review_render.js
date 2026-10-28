@@ -68,6 +68,7 @@ function createPage(responseData, {withMarkdownLibraries = true} = {}) {
   reviewForm.submitButton = submitButton;
   const results = elements.get('#review-results');
   const downloads = [];
+  const renderedMarkdown = [];
   const nativeURL = URL;
   class TestURL extends nativeURL {}
   TestURL.createObjectURL = (blob) => { downloads.push(blob); return 'blob:review-test'; };
@@ -87,7 +88,10 @@ function createPage(responseData, {withMarkdownLibraries = true} = {}) {
     addEventListener() {},
   };
   if (withMarkdownLibraries) {
-    window.marked = {parse: (markdown) => `<h2 data-source="${markdown.includes('Cross-paper interpretation')}">parsed review</h2>`};
+    window.marked = {parse: (markdown) => {
+      renderedMarkdown.push(markdown);
+      return `<h2 data-source="${markdown.includes('Cross-paper interpretation')}">parsed review</h2>`;
+    }};
     window.DOMPurify = {sanitize: (html) => `<p class="sanitized">${html}</p>`};
   }
   const context = vm.createContext({
@@ -103,7 +107,7 @@ function createPage(responseData, {withMarkdownLibraries = true} = {}) {
   });
   const source = fs.readFileSync(require.resolve('../static/app.js'), 'utf8');
   vm.runInContext(source, context, {filename: 'static/app.js'});
-  return {reviewForm, submitButton, results, elements, downloads};
+  return {reviewForm, submitButton, results, elements, downloads, renderedMarkdown};
 }
 
 async function submitReview(page, topic = 'retrieval augmented generation') {
@@ -172,9 +176,39 @@ async function testMissingFieldsAndUnavailableMarkdownLibrariesStayReadable() {
   assert.deepEqual(emptyResponse.repositories, []);
 }
 
+async function testSynthesisFallbackIsRenderedAndDownloadedVerbatimAsIncompleteReview() {
+  const fallback = [
+    '## Incomplete review: synthesis unavailable',
+    '',
+    '## Evidence reported in retrieved abstracts',
+    '',
+    '### [P1] Retrieved study',
+    '',
+    'The abstract reports a limited retrieval experiment.',
+  ].join('\n');
+  const response = {
+    topic: 'retrieval research',
+    review: fallback,
+    papers: [{citation_id: 'P1', title: 'Retrieved study', abstract: 'The abstract reports a limited retrieval experiment.'}],
+    repositories: [],
+    errors: {arxiv: null, github: null, synthesis: 'Model input limit prevented synthesis; evidence is shown.'},
+  };
+  const page = createPage(response);
+  await submitReview(page);
+
+  assert.equal(page.renderedMarkdown.includes(fallback), true, 'the rendered body receives the fallback text');
+  assert.match(page.elements.get('#review-status').textContent, /Showing retrieved evidence/);
+  const downloadButton = findAll(page.results, (node) => node.className === 'download-button')[0];
+  downloadButton.listeners.get('click')();
+  const downloadedMarkdown = await page.downloads[0].text();
+  assert.equal(downloadedMarkdown, reviewToMarkdown(normalizeReviewData(response)));
+  assert.equal(downloadedMarkdown.includes(fallback), true, 'download contains the same incomplete review');
+}
+
 (async () => {
   await testRendersPaperDetailsSafeMarkdownAndMatchingDownload();
   await testMissingFieldsAndUnavailableMarkdownLibrariesStayReadable();
+  await testSynthesisFallbackIsRenderedAndDownloadedVerbatimAsIncompleteReview();
   console.log('Literature review rendering regression checks passed.');
 })().catch((error) => {
   console.error(error);

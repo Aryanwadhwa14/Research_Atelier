@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 from agent import run_agent, generate_literature_review
 from pathlib import Path
 import uuid
+import logging
+import time
 from typing import Optional
 
 # ── FastAPI App ────────────────────────────────────────────────────────────────
@@ -27,8 +29,33 @@ app = FastAPI(
     description="A research assistant powered by LangGraph ReAct agent with web search.",
     version="1.0.0",
 )
+logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def log_request_duration(request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.error(
+            "api_request_failed method=%s path=%s duration_ms=%.1f error_type=%s",
+            request.method,
+            request.url.path,
+            (time.perf_counter() - started) * 1000,
+            type(exc).__name__,
+        )
+        raise
+    logger.info(
+        "api_request_complete method=%s path=%s status=%s duration_ms=%.1f",
+        request.method,
+        request.url.path,
+        response.status_code,
+        (time.perf_counter() - started) * 1000,
+    )
+    return response
 
 
 # ── Request / Response Schemas ─────────────────────────────────────────────────
@@ -156,8 +183,12 @@ def ask_question(request: QuestionRequest):
             steps=result["steps"],
             thread_id=thread_id,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+    except Exception as exc:
+        logger.error("ask_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="The assistant could not complete this request. Please retry in a moment.",
+        )
 
 
 class LiteratureReviewRequest(BaseModel):
@@ -176,4 +207,8 @@ def literature_review(request: LiteratureReviewRequest, response: Response):
     try:
         return generate_literature_review(request.topic)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Literature review failed: {exc}")
+        logger.error("literature_review_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="The literature review could not be completed. Please retry or broaden the topic.",
+        )
