@@ -1,4 +1,4 @@
-# 🔍 Agentic Research Assistant
+#  Agentic Research Assistant
 
 A simple **agentic AI research assistant** built from scratch. Ask any question — an AI agent decides which tool to use (web search, GitHub repository lookup, or arXiv paper search), calls the appropriate tool, and synthesizes a final answer. The UI shows the agent's full reasoning trace so you can see it "thinking."
 
