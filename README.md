@@ -1,151 +1,190 @@
-#  Agentic Research Assistant
+# ResearchOS — Agentic Research Assistant
 
-A simple **agentic AI research assistant** built from scratch. Ask any question — an AI agent decides which tool to use (web search, GitHub repository lookup, or arXiv paper search), calls the appropriate tool, and synthesizes a final answer. The UI shows the agent's full reasoning trace so you can see it "thinking."
+An **agentic AI research assistant** built with **FastAPI**, **LangGraph**, and **Groq**. It supports two core workflows:
+1. **Conversational Research Assistant (`POST /ask`)**: A LangGraph ReAct agent that decides when to answer directly or call external research tools (DuckDuckGo web search, arXiv paper search, and GitHub repository lookup), while preserving per-session conversational memory.
+2. **Literature Review Generator (`POST /literature-review`)**: A source-grounded pipeline that retrieves arXiv papers and GitHub repositories concurrently, ranks up to five papers, synthesizes cross-paper interpretation and candidate research gaps with validation checks, and exports the result as Markdown.
 
-## Architecture
+---
 
+## System Architecture
+
+### High-Level Component Diagram
+
+```mermaid
+flowchart LR
+    subgraph Clients["Clients (Browser & Fallback UI)"]
+        WebUI["Web UI\nstatic/index.html + app.js\n(http://localhost:8000)"]
+        StreamlitUI["Streamlit Fallback\nstreamlit_app.py\n(http://localhost:8501)"]
+    end
+
+    subgraph API["FastAPI Backend (main.py)"]
+        StaticRoute["GET /\nServes static/index.html & /static/*"]
+        HealthRoute["GET /health\nHealth check"]
+        AskRoute["POST /ask\nQuestionRequest → AnswerResponse"]
+        LitRoute["POST /literature-review\nLiteratureReviewRequest"]
+    end
+
+    subgraph Core["Agent & Pipeline Layer (agent.py)"]
+        ReactAgent["LangGraph ReAct Agent\ncreate_react_agent + MemorySaver\n(pre/post hooks + thread locks)"]
+        LitPipeline["Literature Review Pipeline\nThreadPoolExecutor + Ranker\n+ Draft Validator + Fallback"]
+        LLM["ChatGroq LLM\n(openai/gpt-oss-20b)"]
+    end
+
+    subgraph Tools["External Data Sources"]
+        DDG["DuckDuckGo\n(ddgs)"]
+        ArXiv["arXiv REST API\n(arxiv)"]
+        GitHub["GitHub Public REST API\n(api.github.com)"]
+    end
+
+    WebUI -->|"GET / & /static/*"| StaticRoute
+    WebUI -->|"POST /ask"| AskRoute
+    WebUI -->|"POST /literature-review"| LitRoute
+    StreamlitUI -->|"POST /ask"| AskRoute
+
+    AskRoute --> ReactAgent
+    LitRoute --> LitPipeline
+
+    ReactAgent <-->|"Reasoning & tool calls"| LLM
+    ReactAgent -->|"web_search"| DDG
+    ReactAgent -->|"arxiv_tool"| ArXiv
+    ReactAgent -->|"github_repo_info"| GitHub
+
+    LitPipeline -->|"Concurrent retrieval"| ArXiv
+    LitPipeline -->|"Concurrent retrieval"| GitHub
+    LitPipeline <-->|"Synthesis & retry"| LLM
 ```
-┌──────────────┐       POST /ask        ┌──────────────────┐
-│              │ ─────────────────────▶  │                  │
-│  Streamlit   │   { question: "..." }  │   FastAPI         │
-│  Frontend    │                        │   Backend         │
-│              │ ◀─────────────────────  │                  │
-└──────────────┘  { answer, steps[] }   └────────┬─────────┘
-                                                 │
-                                                 │ invokes
-                                                 ▼
-                                        ┌──────────────────┐
-                                        │  LangGraph ReAct  │
-                                        │  Agent            │
-                                        │                  │
-                                        │  LLM: Llama 3.3  │
-                                        │  (via Groq)      │
-                                        └────────┬─────────┘
-                                                 │
-                                          decides │ to call
-                                                 ▼
-                               ┌─────────────────┼─────────────────┐
-                               ▼                 ▼                 ▼
-                      ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-                      │  DuckDuckGo      │ │  GitHub Repo     │ │  arXiv Paper     │
-                      │  Web Search      │ │  Info Tool       │ │  Search Tool     │
-                      │  (no API key)    │ │  (Public API)    │ │  (arXiv API)     │
-                      └──────────────────┘ └──────────────────┘ └──────────────────┘
+
+---
+
+### Request Flow 1: Conversational Research (`POST /ask`)
+
+```mermaid
+sequenceDiagram
+    participant U as Browser / Streamlit
+    participant M as FastAPI (main.py)
+    participant L as Thread Lock & MemorySaver
+    participant G as LangGraph ReAct Loop (agent.py)
+    participant LLM as ChatGroq (openai/gpt-oss-20b)
+    participant T as Tools (DDGS / arXiv / GitHub)
+
+    U->>M: POST /ask { question, thread_id? }
+    M->>M: Generate UUID if thread_id omitted
+    M->>G: run_agent(question, thread_id)
+    G->>L: Acquire striped RLock for thread_id
+    G->>L: Repair any interrupted tool calls in checkpoint
+    loop ReAct Loop
+        G->>G: pre_model_hook (_close_incomplete_tool_calls + bound history)
+        G->>LLM: Invoke model with bounded messages
+        LLM-->>G: Tool calls OR final answer
+        G->>G: post_model_hook (_stop_repeated_tool_batch)
+        opt Tool calls requested
+            G->>T: Execute web_search / arxiv_tool / github_repo_info
+            T-->>G: Bounded tool output
+        end
+    end
+    G-->>M: { answer, steps[] }
+    M-->>U: AnswerResponse { answer, steps, thread_id }
 ```
 
-**Flow:**
-1. User types a question in the Streamlit UI
-2. Streamlit sends a POST request to FastAPI's `/ask` endpoint
-3. FastAPI invokes the LangGraph **ReAct agent**
-4. The agent reasons about the question:
-   - If it can answer from its own knowledge → responds directly
-   - If it needs current/factual web info → calls `web_search` (DuckDuckGo)
-   - If it needs repository details (stars, forks, links) → calls `github_repo_info` (GitHub Public API)
-   - If it needs academic papers, scientific articles, or research publications → calls `arxiv`
-   - It can call tools multiple times if needed
-5. The final answer + reasoning trace (tool calls) are returned to Streamlit
-6. The UI displays both the answer and each tool call the agent made
+#### Key Reliability & Memory Mechanisms (`agent.py`)
+- **Session Memory (`MemorySaver`)**: Each browser tab stores a `threadId` in `sessionStorage` (or `st.session_state.thread_id` in Streamlit) and sends it with every `/ask` request so follow-up questions retain context.
+- **Striped Thread Locking (`_THREAD_LOCKS`)**: 64 `RLock`s serialize concurrent requests sharing the same `thread_id` without blocking unrelated sessions.
+- **History Bounding (`_bound_chat_history`)**: Keeps up to `CHAT_HISTORY_MAX_TURNS` (6) turns within `CHAT_HISTORY_MAX_CHARS` (6,500 chars), shortening older tool results (`CHAT_TOOL_RESULT_MAX_CHARS = 600`) when needed.
+- **Checkpoint Repair (`_close_incomplete_tool_calls` / `_repair_incomplete_tool_history`)**: If a previous run was interrupted mid-tool-batch, unanswered tool calls are closed with explicit error `ToolMessage`s and duplicate tool messages are stripped so the graph can resume cleanly.
+- **Loop Guard (`_stop_repeated_tool_batch`)**: Detects identical `(tool, args)` calls repeated within the same turn and stops the loop so the agent answers from collected evidence.
+
+---
+
+### Request Flow 2: Literature Review Generator (`POST /literature-review`)
+
+```mermaid
+flowchart TD
+    Req["POST /literature-review { topic }"] --> Pool["ThreadPoolExecutor (2 workers)"]
+    Pool --> ArXiv["arXiv Retrieval\n_retrieve_arxiv_records()"]
+    Pool --> GH["GitHub Retrieval\n_retrieve_github_repositories()"]
+    ArXiv --> Rank["rank_papers()\nRank by topic-term overlap\nSelect up to 5 papers (P1..P5)"]
+    Rank --> CheckEmpty{Papers found?}
+    CheckEmpty -- "No" --> EmptyMsg["Return scoped empty-result message"]
+    CheckEmpty -- "Yes" --> Prompt["Build token-bounded prompt\n(P1..P5 titles + abstract excerpts)"]
+    Prompt --> Synth["llm.invoke() synthesis\n## Cross-paper interpretation\n## Candidate research gaps"]
+    Synth --> Validate{"_validate_synthesis_draft()\nCitations, claims, wording, sections"}
+    Validate -- "Pass" --> Compose["_compose_review()\nAttach evidence + synthesis"]
+    Validate -- "Fail (attempt 1)" --> Retry["Retry once with failure feedback"]
+    Retry --> Validate
+    Validate -- "Fail (attempt 2) / Error" --> Fallback["_fallback_review()\nShow retrieved abstracts & metadata only"]
+    Compose --> Resp["Return { topic, papers, repositories, review, errors }"]
+    Fallback --> Resp
+    EmptyMsg --> Resp
+```
+
+- **Evidence vs. Interpretation Separation**: Retrieved paper abstracts and metadata are returned directly; the LLM only writes `## Cross-paper interpretation` and `## Candidate research gaps` using supplied citation IDs (`[P1]`–`[P5]`).
+- **GitHub Context**: GitHub results represent related topic-search repositories unless an explicit paper-to-repository link is evidenced.
+- **Markdown Export**: `static/review_markdown.js` normalizes the payload and formats a downloadable `.md` report.
+
+---
+
+## Layer Breakdown
+
+| Layer | File(s) | Responsibility |
+|---|---|---|
+| **Web Frontend** | [static/index.html](static/index.html), [static/app.js](static/app.js), [static/review_markdown.js](static/review_markdown.js), [static/styles.css](static/styles.css) | Browser UI for research chat (`/ask`), Literature Review Generator (`/literature-review`), light/dark theme persistence, sanitized Markdown rendering (`marked` + `DOMPurify`), and `.md` download |
+| **Fallback UI** | [streamlit_app.py](streamlit_app.py), [theme_tokens.py](theme_tokens.py), [.streamlit/config.toml](.streamlit/config.toml) | Optional Streamlit frontend that sends `/ask` requests to `http://localhost:8000` |
+| **API Server** | [main.py](main.py) | FastAPI app, request/response Pydantic validation, request timing middleware, static file serving, `/health`, `/ask`, `/literature-review`, and Swagger `/docs` |
+| **Agent & Pipelines** | [agent.py](agent.py) | `ChatGroq` LLM setup, LangGraph `create_react_agent`, `web_search` / `arxiv_tool` / `github_repo_info` tools, memory & loop guardrails, and the literature review pipeline |
+| **Tests** | [tests/](tests/) | Offline Python `unittest` suites (`test_agent_runtime.py`, `test_chat_completion.py`, `test_literature_review.py`) and frontend JS tests (`test_chat_frontend.js`, `test_literature_review_render.js`, `test_review_markdown.js`) |
+| **Deployment** | [render.yaml](render.yaml), [requirements.txt](requirements.txt) | Render web service configuration (`uvicorn main:app --host 0.0.0.0 --port $PORT`) and Python dependencies |
+
+---
 
 ## Agent Tools
 
-The agent is equipped with the following tools:
+1. **`web_search`** (DuckDuckGo via `ddgs`): Searches the open web for current events, facts, and general research without requiring an API key.
+2. **`arxiv_tool`** (arXiv REST API via `arxiv`): Searches arXiv for academic preprints and papers across CS, physics, math, quantitative biology, and related fields.
+3. **`github_repo_info`** (GitHub Public REST API): Fetches repository metadata (stars, forks, open issues, description, primary language, license, URL) for `owner/repo` inputs without authentication.
 
-1. **`web_search`** (DuckDuckGo): Searches the web for current events, facts, articles, and general research without requiring an API key.
-   - *Example question:* "What are the latest breakthroughs in fusion energy?"
-2. **`github_repo_info`** (GitHub REST API): Fetches real-time repository metadata including star count, forks, open issues, description, primary language, license, and repository URL without requiring authentication.
-   - *Example questions:*
-     - "How many stars does langchain-ai/langchain have?"
-     - "Give me the link to facebook/react"
-     - "What is the primary language and description of tiangolo/fastapi?"
-3. **`arxiv`** (arXiv.org REST API): Searches arXiv for scientific papers, academic preprints, and research publications across physics, computer science, mathematics, quantitative biology, and related fields.
-   - *Example questions:*
-     - "Find recent papers on retrieval augmented generation"
-     - "Summarize a paper about LLM agents"
-
-## Conversational Memory
-
-The agent now supports **persistent conversation history per browser session** using LangGraph's `MemorySaver` checkpoint system.
-
-### How It Works
-
-- Each Streamlit browser session automatically gets a unique `thread_id` stored in `st.session_state`
-- This `thread_id` is sent with every request to the FastAPI backend
-- The LangGraph agent uses this `thread_id` to load and save conversation history
-- Follow-up questions can reference previous answers, and the agent understands the context
-
-### Example: Multi-Turn Conversation
-
-**Turn 1 — User asks:**
-```
-What's the latest Python version?
-```
-
-**Agent responds:**
-```
-As of my latest knowledge update, Python 3.13 is the latest stable release...
-```
-
-**Turn 2 — User asks a follow-up (same browser session):**
-```
-Is it backward compatible with 3.11 code?
-```
-
-**Agent understands context:**
-```
-Python 3.13 maintains backward compatibility with Python 3.11. Most standard
-library changes and deprecations are managed carefully to avoid breaking existing code...
-```
-The agent understood that "it" refers to "Python 3.13" from the previous turn, demonstrating that conversation history is retained.
-
-### Technical Details
-
-- **Backend:** FastAPI accepts an optional `thread_id` in the request. If not provided, a new UUID is generated.
-- **Frontend:** Streamlit initializes `st.session_state.thread_id` on first page load and includes it in all requests.
-- **Checkpointing:** The LangGraph agent uses `MemorySaver()` to persist the conversation state, automatically loading prior messages for the same `thread_id`.
-
-### Resetting the Conversation
-
-To start a new conversation (clearing history), simply refresh the browser page. A new `thread_id` will be generated automatically.
-
-## Tech Stack
-
-| Component        | Technology                                       |
-|-----------------|--------------------------------------------------|
-| Backend          | FastAPI + Uvicorn                                |
-| Agent Framework  | LangGraph (`create_react_agent`)                 |
-| LLM              | Llama 3.3 70B via Groq (ChatGroq)               |
-| Tools            | DuckDuckGo Search, GitHub REST API, arXiv API    |
-| Frontend         | Static HTML/CSS/JS served by FastAPI; Streamlit fallback |
-| Env Management   | python-dotenv                                    |
+---
 
 ## Project Structure
 
+```text
+Research_Atelier/
+├── main.py                              # FastAPI backend & static UI host
+├── agent.py                             # LangGraph ReAct agent, tools & literature review pipeline
+├── streamlit_app.py                     # Optional Streamlit UI (connects to FastAPI)
+├── theme_tokens.py                      # Design tokens for Streamlit UI
+├── requirements.txt                     # Python dependencies
+├── render.yaml                          # Render deployment blueprint
+├── .env                                 # Local environment variables (GROQ_API_KEY) — not committed
+├── .streamlit/
+│   └── config.toml                      # Streamlit configuration
+├── static/
+│   ├── index.html                       # ResearchOS web UI
+│   ├── app.js                           # Browser-side chat, review UI & theme logic
+│   ├── review_markdown.js               # Literature review normalization & Markdown export
+│   └── styles.css                       # Light/dark theme styles
+└── tests/
+    ├── test_agent_runtime.py
+    ├── test_chat_completion.py
+    ├── test_literature_review.py
+    ├── test_chat_frontend.js
+    ├── test_literature_review_render.js
+    └── test_review_markdown.js
 ```
-agentic-research-assistant/
-├── main.py              # FastAPI app with /ask endpoint
-├── agent.py             # LangGraph agent (LLM + tools + create_react_agent)
-├── streamlit_app.py     # Streamlit UI (input, answer, reasoning trace)
-├── static/              # Browser UI (index.html, styles.css, app.js)
-├── requirements.txt     # Python dependencies
-├── .env.example         # Template for environment variables
-├── .gitignore           # Excludes .env and Python artifacts
-└── README.md            # This file
+
+---
+
+## Setup & Run Locally
+
+### 1. Enter the project directory
+```powershell
+cd d:\Aryan\researchOS\Research_Atelier
 ```
 
-## Setup & Run
-
-### 1. Clone & enter the project
-
-```bash
-cd agentic-research-assistant
-```
-
-### 2. Create a virtual environment
-
-```bash
+### 2. Create & activate a virtual environment
+```powershell
 python -m venv venv
 
-# Windows
+# Windows (PowerShell)
 venv\Scripts\activate
 
 # macOS/Linux
@@ -153,56 +192,32 @@ source venv/bin/activate
 ```
 
 ### 3. Install dependencies
-
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-### 4. Set up your Groq API key
-
-```bash
-# Copy the example env file
-cp .env.example .env
-
-# Edit .env and paste your Groq API key
-# Get a free key at: https://console.groq.com/keys
+### 4. Configure your Groq API key
+Create a `.env` file in the project root (`Research_Atelier/.env`) with your Groq API key (get one at https://console.groq.com/keys):
+```env
+GROQ_API_KEY=your_groq_api_key_here
 ```
 
-### 5. Start the FastAPI backend and browser UI
-
-```bash
+### 5. Start the FastAPI backend & web UI
+```powershell
 uvicorn main:app --reload
 ```
+- **Web UI:** `http://localhost:8000`
+- **Swagger API Docs:** `http://localhost:8000/docs`
+- **Health Check:** `http://localhost:8000/health`
 
-The browser UI and API will be live at `http://localhost:8000`. API docs are at `http://localhost:8000/docs` (Swagger UI), and the health check is `http://localhost:8000/health`.
+### 6. (Optional) Start the Streamlit fallback UI
+In a **second terminal** (with `venv` activated and `uvicorn` running):
+```powershell
+streamlit run streamlit_app.py
+```
+Opens at `http://localhost:8501`.
 
-The browser UI includes a research chat (`POST /ask`) and a Literature Review Generator (`POST /literature-review`). The latter ranks arXiv candidates by topic-term overlap in titles and abstracts, then selects up to five records. The generated review separates abstract evidence from interpretation and labels gaps as candidates limited by the small, search-dependent sample. Citation IDs refer to the returned paper records; this checks reference mapping, not whether every sentence is supported by its citation. GitHub results are related topic-search repositories unless a paper-to-repository link is explicitly evidenced. The result can be downloaded as Markdown. If synthesis fails validation, the fallback presents retrieved abstracts and metadata without inventing comparisons or gaps.
-
-Run the offline literature-review tests with:
-
-```bash
+### 7. Run offline tests
+```powershell
 python -m unittest discover -s tests
 ```
-
-### 6. Start the Streamlit frontend (new terminal)
-
-```bash
-streamlit run streamlit_app.py
-```
-
-The UI will open at `http://localhost:8501`.
-
-## Streamlit Fallback
-
-The original Streamlit interface remains available in a separate terminal:
-
-```bash
-streamlit run streamlit_app.py
-```
-
-## Usage
-
-1. Open `http://localhost:8000` in your browser (or use the Streamlit fallback)
-2. Type a question (e.g., "What are the latest breakthroughs in fusion energy?")
-3. Click **Ask the Agent**
-4. See the agent's answer and expand the reasoning trace to see which web searches it performed
